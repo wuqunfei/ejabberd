@@ -33,7 +33,7 @@
 %%% NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 %%% POSSIBILITY OF SUCH DAMAGE.
 %%% ==========================================================================================================
-%%% ejabberd, Copyright (C) 2002-2015   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%----------------------------------------------------------------------
 
 -module(ejabberd_websocket).
@@ -47,7 +47,7 @@
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("jlib.hrl").
+-include("xmpp.hrl").
 
 -include("ejabberd_http.hrl").
 
@@ -88,7 +88,8 @@ check(_Path, Headers) ->
     end.
 
 socket_handoff(LocalPath, #request{method = 'GET', ip = IP, q = Q, path = Path,
-                                   headers = Headers, host = Host, port = Port},
+                                   headers = Headers, host = Host, port = Port,
+                                   opts = HOpts},
                Socket, SockMod, Buf, _Opts, HandlerModule, InfoMsgFun) ->
     case check(LocalPath, Headers) of
         true ->
@@ -101,7 +102,8 @@ socket_handoff(LocalPath, #request{method = 'GET', ip = IP, q = Q, path = Path,
                      path = Path,
                      headers = Headers,
                      local_path = LocalPath,
-                     buf = Buf},
+                     buf = Buf,
+                     http_opts = HOpts},
 
             connect(WS, HandlerModule);
         _ ->
@@ -150,8 +152,8 @@ handshake(#ws{headers = Headers} = State) ->
                             V ->
                                 [<<"Sec-Websocket-Protocol:">>, V, <<"\r\n">>]
                         end,
-    Hash = jlib:encode_base64(
-             p1_sha:sha1(<<Key/binary, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11">>)),
+    Hash = base64:encode(
+             crypto:hash(sha, <<Key/binary, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11">>)),
     {State, [<<"HTTP/1.1 101 Switching Protocols\r\n">>,
              <<"Upgrade: websocket\r\n">>,
              <<"Connection: Upgrade\r\n">>,
@@ -371,10 +373,10 @@ process_frame(#frame_info{unprocessed =
     process_frame(FrameInfo#frame_info{unprocessed = <<>>},
                   <<UnprocessedPre/binary, Data/binary>>).
 
-handle_data(tcp, FrameInfo, Data, Socket, WsHandleLoopPid, p1_tls) ->
-    case p1_tls:recv_data(Socket, Data) of
+handle_data(tcp, FrameInfo, Data, Socket, WsHandleLoopPid, fast_tls) ->
+    case fast_tls:recv_data(Socket, Data) of
         {ok, NewData} ->
-            handle_data_int(FrameInfo, NewData, Socket, WsHandleLoopPid, p1_tls);
+            handle_data_int(FrameInfo, NewData, Socket, WsHandleLoopPid, fast_tls);
         {error, Error} ->
             {error, Error}
     end;

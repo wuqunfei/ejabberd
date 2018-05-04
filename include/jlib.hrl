@@ -1,6 +1,6 @@
 %%%----------------------------------------------------------------------
 %%%
-%%% ejabberd, Copyright (C) 2002-2015   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -19,11 +19,7 @@
 %%%----------------------------------------------------------------------
 
 -include("ns.hrl").
--ifdef(NO_EXT_LIB).
--include("xml.hrl").
--else.
--include_lib("p1_xml/include/xml.hrl").
--endif.
+-include("fxml.hrl").
 
 -define(STANZA_ERROR(Code, Type, Condition),
 	#xmlel{name = <<"error">>,
@@ -475,15 +471,15 @@
 
 -type(iq() :: iq_request() | iq_reply()).
 
--record(rsm_in, {max :: integer() | error,
-                 direction :: before | aft,
-                 id :: binary(),
-                 index :: integer() | error}).
+-record(rsm_in, {max :: integer() | error | undefined,
+                 direction :: before | aft | undefined,
+                 id :: binary() | undefined,
+                 index :: integer() | error | undefined}).
 
--record(rsm_out, {count :: integer(),
-                  index :: integer(),
-                  first :: binary(),
-                  last :: binary()}).
+-record(rsm_out, {count :: integer() | undefined,
+                  index :: integer() | undefined,
+                  first :: binary() | undefined,
+                  last :: binary() | undefined}).
 
 -type(rsm_in() :: #rsm_in{}).
 

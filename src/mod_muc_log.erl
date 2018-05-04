@@ -5,7 +5,7 @@
 %%% Created : 12 Mar 2006 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2015   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,7 +25,7 @@
 
 -module(mod_muc_log).
 
--behaviour(ejabberd_config).
+-protocol({xep, 334, '0.2'}).
 
 -author('badlop@process-one.net').
 
@@ -34,26 +34,20 @@
 -behaviour(gen_mod).
 
 %% API
--export([start_link/2, start/2, stop/1, transform_module_options/1,
+-export([start/2, stop/1, reload/3, transform_module_options/1,
 	 check_access_log/2, add_to_log/5]).
 
 -export([init/1, handle_call/3, handle_cast/2,
 	 handle_info/2, terminate/2, code_change/3,
-	 mod_opt_type/1, opt_type/1]).
+	 mod_opt_type/1, mod_options/1, depends/2]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("jlib.hrl").
-
+-include("xmpp.hrl").
 -include("mod_muc_room.hrl").
 
-%% Copied from mod_muc/mod_muc.erl
--record(muc_online_room, {name_host = {<<>>, <<>>} :: {binary(), binary()},
-                          pid = self() :: pid()}).
-
 -define(T(Text), translate:translate(Lang, Text)).
--define(PROCNAME, ejabberd_mod_muc_log).
 -record(room, {jid, title, subject, subject_author, config}).
 
 -define(PLAINTEXT_CO, <<"ZZCZZ">>).
@@ -76,29 +70,15 @@
 %%====================================================================
 %% API
 %%====================================================================
-%%--------------------------------------------------------------------
-%% Function: start_link() -> {ok,Pid} | ignore | {error,Error}
-%% Description: Starts the server
-%%--------------------------------------------------------------------
-start_link(Host, Opts) ->
-    Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
-    gen_server:start_link({local, Proc}, ?MODULE, [Host, Opts], []).
-
 start(Host, Opts) ->
-    Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
-    ChildSpec =
-	{Proc,
-	 {?MODULE, start_link, [Host, Opts]},
-	 temporary,
-	 1000,
-	 worker,
-	 [?MODULE]},
-    supervisor:start_child(ejabberd_sup, ChildSpec).
+    gen_mod:start_child(?MODULE, Host, Opts).
 
 stop(Host) ->
-    Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
-    gen_server:call(Proc, stop),
-    supervisor:delete_child(ejabberd_sup, Proc).
+    gen_mod:stop_child(?MODULE, Host).
+
+reload(Host, NewOpts, _OldOpts) ->
+    Proc = get_proc_name(Host),
+    gen_server:cast(Proc, {reload, NewOpts}).
 
 add_to_log(Host, Type, Data, Room, Opts) ->
     gen_server:cast(get_proc_name(Host),
@@ -120,143 +100,75 @@ transform_module_options(Opts) ->
               Opt
       end, Opts).
 
+depends(_Host, _Opts) ->
+    [{mod_muc, hard}].
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
-
-%%--------------------------------------------------------------------
-%% Function: init(Args) -> {ok, State} |
-%%                         {ok, State, Timeout} |
-%%                         ignore               |
-%%                         {stop, Reason}
-%% Description: Initiates the server
-%%--------------------------------------------------------------------
 init([Host, Opts]) ->
-    OutDir = gen_mod:get_opt(outdir, Opts,
-                             fun iolist_to_binary/1,
-                             <<"www/muc">>),
-    DirType = gen_mod:get_opt(dirtype, Opts, 
-                              fun(subdirs) -> subdirs;
-                                 (plain) -> plain
-                              end, subdirs),
-    DirName = gen_mod:get_opt(dirname, Opts,
-                              fun(room_jid) -> room_jid;
-                                 (room_name) -> room_name
-                              end, room_jid),
-    FileFormat = gen_mod:get_opt(file_format, Opts,
-                                 fun(html) -> html;
-                                    (plaintext) -> plaintext
-                                 end, html),
-    FilePermissions = gen_mod:get_opt(file_permissions, Opts,
-                                 fun(SubOpts) ->
-                                         F = fun({mode, Mode}, {_M, G}) ->
-                                                        {Mode, G};
-                                                ({group, Group}, {M, _G}) ->
-                                                        {M, Group}
-                                             end,
-                                         lists:foldl(F, {644, 33}, SubOpts)
-                                 end, {644, 33}),
-    CSSFile = gen_mod:get_opt(cssfile, Opts,
-                              fun iolist_to_binary/1,
-                              false),
-    AccessLog = gen_mod:get_opt(access_log, Opts,
-                                fun(A) when is_atom(A) -> A end,
-                                muc_admin),
-    Timezone = gen_mod:get_opt(timezone, Opts,
-                               fun(local) -> local;
-                                  (universal) -> universal
-                               end, local),
-    Top_link = gen_mod:get_opt(top_link, Opts,
-                               fun([{S1, S2}]) ->
-                                       {iolist_to_binary(S1),
-                                        iolist_to_binary(S2)}
-                               end, {<<"/">>, <<"Home">>}),
-    NoFollow = gen_mod:get_opt(spam_prevention, Opts,
-                               fun(B) when is_boolean(B) -> B end,
-                               true),
-    Lang = ejabberd_config:get_option(
-             {language, Host},
-             fun iolist_to_binary/1,
-             ?MYLANG),
-    {ok,
-     #logstate{host = Host, out_dir = OutDir,
-	       dir_type = DirType, dir_name = DirName,
-	       file_format = FileFormat, file_permissions = FilePermissions, css_file = CSSFile,
-	       access = AccessLog, lang = Lang, timezone = Timezone,
-	       spam_prevention = NoFollow, top_link = Top_link}}.
+    process_flag(trap_exit, true),
+    {ok, init_state(Host, Opts)}.
 
-%%--------------------------------------------------------------------
-%% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
-%%                                      {reply, Reply, State, Timeout} |
-%%                                      {noreply, State} |
-%%                                      {noreply, State, Timeout} |
-%%                                      {stop, Reason, Reply, State} |
-%%                                      {stop, Reason, State}
-%% Description: Handling call messages
-%%--------------------------------------------------------------------
 handle_call({check_access_log, ServerHost, FromJID}, _From, State) ->
     Reply = acl:match_rule(ServerHost, State#logstate.access, FromJID),
     {reply, Reply, State};
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State}.
 
-%%--------------------------------------------------------------------
-%% Function: handle_cast(Msg, State) -> {noreply, State} |
-%%                                      {noreply, State, Timeout} |
-%%                                      {stop, Reason, State}
-%% Description: Handling cast messages
-%%--------------------------------------------------------------------
+handle_cast({reload, Opts}, #logstate{host = Host}) ->
+    {noreply, init_state(Host, Opts)};
 handle_cast({add_to_log, Type, Data, Room, Opts}, State) ->
     case catch add_to_log2(Type, Data, Room, Opts, State) of
       {'EXIT', Reason} -> ?ERROR_MSG("~p", [Reason]);
       _ -> ok
     end,
     {noreply, State};
-handle_cast(_Msg, State) -> {noreply, State}.
+handle_cast(Msg, State) ->
+    ?WARNING_MSG("unexpected cast: ~p", [Msg]),
+    {noreply, State}.
 
-%%--------------------------------------------------------------------
-%% Function: handle_info(Info, State) -> {noreply, State} |
-%%                                       {noreply, State, Timeout} |
-%%                                       {stop, Reason, State}
-%% Description: Handling all non call/cast messages
-%%--------------------------------------------------------------------
 handle_info(_Info, State) -> {noreply, State}.
 
-%%--------------------------------------------------------------------
-%% Function: terminate(Reason, State) -> void()
-%% Description: This function is called by a gen_server when it is about to
-%% terminate. It should be the opposite of Module:init/1 and do any necessary
-%% cleaning up. When it returns, the gen_server terminates with Reason.
-%% The return value is ignored.
-%%--------------------------------------------------------------------
 terminate(_Reason, _State) -> ok.
 
-%%--------------------------------------------------------------------
-%% Func: code_change(OldVsn, State, Extra) -> {ok, NewState}
-%% Description: Convert process state when code is changed
-%%--------------------------------------------------------------------
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
+init_state(Host, Opts) ->
+    OutDir = gen_mod:get_opt(outdir, Opts),
+    DirType = gen_mod:get_opt(dirtype, Opts),
+    DirName = gen_mod:get_opt(dirname, Opts),
+    FileFormat = gen_mod:get_opt(file_format, Opts),
+    FilePermissions = gen_mod:get_opt(file_permissions, Opts),
+    CSSFile = gen_mod:get_opt(cssfile, Opts),
+    AccessLog = gen_mod:get_opt(access_log, Opts),
+    Timezone = gen_mod:get_opt(timezone, Opts),
+    Top_link = gen_mod:get_opt(top_link, Opts),
+    NoFollow = gen_mod:get_opt(spam_prevention, Opts),
+    Lang = ejabberd_config:get_lang(Host),
+    #logstate{host = Host, out_dir = OutDir,
+	      dir_type = DirType, dir_name = DirName,
+	      file_format = FileFormat, css_file = CSSFile,
+	      file_permissions = FilePermissions,
+	      access = AccessLog, lang = Lang, timezone = Timezone,
+	      spam_prevention = NoFollow, top_link = Top_link}.
+
 add_to_log2(text, {Nick, Packet}, Room, Opts, State) ->
-    case {xml:get_subtag(Packet, <<"no-store">>),
-	  xml:get_subtag(Packet, <<"no-permanent-store">>)}
-	of
-      {false, false} ->
-	  case {xml:get_subtag(Packet, <<"subject">>),
-		xml:get_subtag(Packet, <<"body">>)}
-	      of
-	    {false, false} -> ok;
-	    {false, SubEl} ->
-		Message = {body, xml:get_tag_cdata(SubEl)},
-		add_message_to_log(Nick, Message, Room, Opts, State);
-	    {SubEl, _} ->
-		Message = {subject, xml:get_tag_cdata(SubEl)},
-		add_message_to_log(Nick, Message, Room, Opts, State)
-	  end;
-      {_, _} -> ok
+    case has_no_permanent_store_hint(Packet) of
+	false ->
+	    case {Packet#message.subject, Packet#message.body} of
+		{[], []} -> ok;
+		{[], Body} ->
+		    Message = {body, xmpp:get_text(Body)},
+		    add_message_to_log(Nick, Message, Room, Opts, State);
+		{Subj, _} ->
+		    Message = {subject, xmpp:get_text(Subj)},
+		    add_message_to_log(Nick, Message, Room, Opts, State)
+	    end;
+	true -> ok
     end;
 add_to_log2(roomconfig_change, _Occupants, Room, Opts,
 	    State) ->
@@ -298,18 +210,18 @@ build_filename_string(TimeStamp, OutDir, RoomJID,
     {Dir, Filename, Rel} = case DirType of
 			     subdirs ->
 				 SYear =
-				     iolist_to_binary(io_lib:format("~4..0w",
+				     (str:format("~4..0w",
 								    [Year])),
 				 SMonth =
-				     iolist_to_binary(io_lib:format("~2..0w",
+				     (str:format("~2..0w",
 								    [Month])),
-				 SDay = iolist_to_binary(io_lib:format("~2..0w",
+				 SDay = (str:format("~2..0w",
 								       [Day])),
 				 {fjoin([SYear, SMonth]), SDay,
 				  <<"../..">>};
 			     plain ->
 				 Date =
-				     iolist_to_binary(io_lib:format("~4..0w-~2..0w-~2..0w",
+				     (str:format("~4..0w-~2..0w-~2..0w",
 								    [Year,
 								     Month,
 								     Day])),
@@ -329,7 +241,7 @@ build_filename_string(TimeStamp, OutDir, RoomJID,
     {Fd, Fn, Fnrel}.
 
 get_room_name(RoomJID) ->
-    JID = jlib:string_to_jid(RoomJID), JID#jid.user.
+    JID = jid:decode(RoomJID), JID#jid.user.
 
 %% calculate day before
 get_timestamp_daydiff(TimeStamp, Daydiff) ->
@@ -351,12 +263,11 @@ close_previous_log(Fn, Images_dir, FileFormat) ->
 
 write_last_lines(_, _, plaintext) -> ok;
 write_last_lines(F, Images_dir, _FileFormat) ->
-%% list_to_integer/2 was introduced in OTP R14
     fw(F, <<"<div class=\"legend\">">>),
     fw(F,
        <<"  <a href=\"http://www.ejabberd.im\"><img "
 	 "style=\"border:0\" src=\"~s/powered-by-ejabbe"
-	 "rd.png\" alt=\"Powered by ejabberd\"/></a>">>,
+	 "rd.png\" alt=\"Powered by ejabberd - robust, scalable and extensible XMPP server\"/></a>">>,
        [Images_dir]),
     fw(F,
        <<"  <a href=\"http://www.erlang.org/\"><img "
@@ -380,7 +291,7 @@ write_last_lines(F, Images_dir, _FileFormat) ->
     fw(F, <<"</span></div></body></html>">>).
 
 set_filemode(Fn, {FileMode, FileGroup}) ->
-	ok = file:change_mode(Fn, list_to_integer(integer_to_list(FileMode), 8)),
+    ok = file:change_mode(Fn, list_to_integer(integer_to_list(FileMode), 8)),
     ok = file:change_group(Fn, FileGroup).
 
 htmlize_nick(Nick1, html) ->
@@ -399,7 +310,7 @@ add_message_to_log(Nick1, Message, RoomJID, Opts,
     Room = get_room_info(RoomJID, Opts),
     Nick = htmlize(Nick1, FileFormat),
     Nick2 = htmlize_nick(Nick1, FileFormat),
-    Now = now(),
+    Now = p1_time_compat:timestamp(),
     TimeStamp = case Timezone of
 		  local -> calendar:now_to_local_time(Now);
 		  universal -> calendar:now_to_universal_time(Now)
@@ -464,31 +375,31 @@ add_message_to_log(Nick1, Message, RoomJID, Opts,
 		 io_lib:format("<font class=\"ml\">~s ~s: ~s</font><br/>",
 			       [Nick, ?T(<<"leaves the room">>),
 				htmlize(Reason, NoFollow, FileFormat)]);
-	     {kickban, <<"301">>, <<"">>} ->
+	     {kickban, 301, <<"">>} ->
 		 io_lib:format("<font class=\"mb\">~s ~s</font><br/>",
 			       [Nick, ?T(<<"has been banned">>)]);
-	     {kickban, <<"301">>, Reason} ->
+	     {kickban, 301, Reason} ->
 		 io_lib:format("<font class=\"mb\">~s ~s: ~s</font><br/>",
 			       [Nick, ?T(<<"has been banned">>),
 				htmlize(Reason, FileFormat)]);
-	     {kickban, <<"307">>, <<"">>} ->
+	     {kickban, 307, <<"">>} ->
 		 io_lib:format("<font class=\"mk\">~s ~s</font><br/>",
 			       [Nick, ?T(<<"has been kicked">>)]);
-	     {kickban, <<"307">>, Reason} ->
+	     {kickban, 307, Reason} ->
 		 io_lib:format("<font class=\"mk\">~s ~s: ~s</font><br/>",
 			       [Nick, ?T(<<"has been kicked">>),
 				htmlize(Reason, FileFormat)]);
-	     {kickban, <<"321">>, <<"">>} ->
+	     {kickban, 321, <<"">>} ->
 		 io_lib:format("<font class=\"mk\">~s ~s</font><br/>",
 			       [Nick,
 				?T(<<"has been kicked because of an affiliation "
 				     "change">>)]);
-	     {kickban, <<"322">>, <<"">>} ->
+	     {kickban, 322, <<"">>} ->
 		 io_lib:format("<font class=\"mk\">~s ~s</font><br/>",
 			       [Nick,
 				?T(<<"has been kicked because the room has "
 				     "been changed to members-only">>)]);
-	     {kickban, <<"332">>, <<"">>} ->
+	     {kickban, 332, <<"">>} ->
 		 io_lib:format("<font class=\"mk\">~s ~s</font><br/>",
 			       [Nick,
 				?T(<<"has been kicked because of a system "
@@ -589,188 +500,23 @@ make_dir_rec(Dir) ->
 %% {ok, F1}=file:open("valid-xhtml10.png", [read]).
 %% {ok, F1b}=file:read(F1, 1000000).
 %% c("../../ejabberd/src/jlib.erl").
-%% jlib:encode_base64(F1b).
-
-image_base64(<<"powered-by-erlang.png">>) ->
-    <<"iVBORw0KGgoAAAANSUhEUgAAAGUAAAAfCAYAAAD+xQNoA"
-      "AADN0lEQVRo3u1aP0waURz+rjGRRQ+nUyRCYmJyDPTapD"
-      "ARaSIbTUjt1gVSh8ZW69aBAR0cWLSxCXWp59LR1jbdqKn"
-      "GxoQuRZZrSYyHEVM6iZMbHewROA7u3fHvkr5vOn737vcu"
-      "33ffu9/vcQz+gef5Cij6CkmSGABgFEH29r5SVvqIsTEOH"
-      "o8HkiQxDBXEOjg9PcHc3BxuUSqsI8jR0REAUFGsCCoKFY"
-      "WCBAN6AxyO0Z7cyMXFb6oGqSgAsIrJut9hMQlvdNbUhKW"
-      "shLd3HtTF4jihShgVpRaBxKKmIGX5HL920/hz/BM2+zAm"
-      "pn2YioQaxnECj0BiEYcrG0Tzzc8/rfudSm02jaVSm9Vr1"
-      "MdG8rSKKXlJ7lHrfjouCut2IrC82BDPbe/gc+xlXez7Kx"
-      "Ez63H4lmIN473Rh8Si1BKhRY6aEJI8pLmbjSPN0xOnBBI"
-      "Lmg5RC6Lg28preKOzsNmHG8R1Bf0o7GdMucUslDy1pJLG"
-      "2sndVVG0lq3c9vum4zmBR1kuwiYMN5ybmCYXxQg57ThFO"
-      "TYznzpPO+IQi+IK+jXjg/YhuIJ+cIIHg+wQJoJ+2N3jYN"
-      "3Olvk4ge/IU98spne+FfGtlslm16nna8fduntfDscoVjG"
-      "JqUgIjz686ViFUdjP4N39x9Xq638viZVtlq2tLXKncLf5"
-      "ticuZSWU5XOUshJKxxKtfdtdvs4OyNb/68urKvlluYizg"
-      "wwu5SLK8jllu1t9ihYOlzdwdpBBKSvh+vKKzHkCj1JW3y"
-      "1m+hSj13WjqOiJKK0qpXKhSFxJAYBvKYaZ9TjWRu4SiWi"
-      "2LyDtb6wghGmn5HfTml16ILGA/G5al2DW7URYTFYrOU7g"
-      "icQ020sYqYDM9CbdgqFd4vzHL03JfvLjk6ZgADAVCSEsJ"
-      "vHsdL+utNYrm2ufZDVZSkzPKaQkW8kthpyS297BvRdRzR"
-      "6DdTurJbPy9Ov1K6xr3HBPQuIMowR3asegUyDuU9SuUG+"
-      "dmIGyZ0b7FBN9St3WunyC5yMsrVv7uXzRP58s/qKn6C4q"
-      "lQoVxVIvd4YBwzBUFKs6ZaD27U9hEdcAN98Sx2IxykafI"
-      "YrizbfESoB+dd9/KF/d/wX3cJvREzl1vAAAAABJRU5Erk"
-      "Jggg==">>;
-image_base64(<<"valid-xhtml10.png">>) ->
-    <<"iVBORw0KGgoAAAANSUhEUgAAAFgAAAAfCAMAAAEjEcpEA"
-      "AACiFBMVEUAAADe5+fOezmtra3ejEKlhELvvWO9WlrehE"
-      "LOe3vepaWclHvetVLGc3PerVKcCAj3vVqUjHOUe1JjlL0"
-      "xOUpjjL2UAAC91ueMrc7vrVKlvdbW3u+EpcbO3ufO1ucY"
-      "WpSMKQi9SiF7e3taWkoQEAiMczkQSoxaUkpzc3O1lEoIC"
-      "ACEazEhGAgIAACEYzFra2utjELWcznGnEr/7+9jY2POaz"
-      "HOYzGta2NShLVrlL05OUqctdacCADGa2ucAADGpVqUtc6"
-      "1ORg5OTmlUikYGAiUezl7YzEYEAiUczkxMTG9nEqtIRDe"
-      "3t4AMXu9lEoQCACMazEAKXspKSmljFrW1ta1jELOzs7n7"
-      "/fGxsa9pVqEOSkpY5xznL29tZxahLXOpVr/99ZrY1L/79"
-      "ZjUiljSikAOYTvxmMAMYScezmchFqUczGtlFp7c2utjFq"
-      "UlJStxt73///39/9Ce61CSkq9xsZznMbW5+9Cc62MjIxC"
-      "Qkrv9/fv7/fOzsbnlErWjIz/3mtCORhza1IpIRBzWjH/1"
-      "mtCMRhzY1L/zmvnvVpSQiHOpVJrUinntVr3zmOEc1L3xm"
-      "NaWlq1nFo5QkrGWim1lFoISpRSUlK1zt4hWpwASoz////"
-      "///8xa6WUaykAQoxKe61KSkp7nMbWtWPe5+9jWlL39/f3"
-      "9/fWrWNCQkLera3nvWPv7+85MRjntWPetVp7c1IxKRCUl"
-      "HtKORh7a1IxIRCUjHtaSiHWrVIpIQhzWinvvVpaQiH/1m"
-      "PWpVKMe1L/zmP/xmNrUiGErc4YGBj/73PG1ucQWpT/53O"
-      "9nFoQUpS1SiEQEBC9zt69vb05c6UISoxSUko5a6UICAhS"
-      "SkohUpS1tbXetWMAQoSUgD+kAAAA2HRSTlP/////////i"
-      "P9sSf//dP////////////////////////////////////"
-      "////////////8M////////////ef/////////////////"
-      "/////////////////////////////////////////////"
-      "//////////////////////9d/////////////////////"
-      "///////////////AP//////////////CP//RP////////"
-      "/////////////////////////////////////////////"
-      "///////9xPp1gAAAFvUlEQVR42pVWi18URRwfy7vsYUba"
-      "iqBRBFmICUQGVKcZckQeaRJQUCLeycMSfKGH0uo5NELpI"
-      "vGQGzokvTTA85VHKTpbRoeJnPno/p1+M7t3txj20e/Nzu"
-      "7Ofve7v/k9Zg4Vc+wRQMW0eyLx1ZSANeBDxVmxZZSwEUY"
-      "kGAewm1eIBOMRvhv1UA+q8KXIVuxGdCelFYwxAnxOrxgb"
-      "Y8Ti1t4VA0QHYz4x3FnVC8OVLXv9fkKGSWDoW/4lG6Vbd"
-      "tBblesOs+MjmEmzJKNIJWFEfEQTCWNPFKvcKEymjLO1b8"
-      "bwYQd1hCiiDCl5KsrDCIlhj4fSuvcpfSpgJmyv6dzeZv+"
-      "nMPx3dhbt94II07/JZliEtm1N2RIYPkTYshwYm245a/zk"
-      "WjJwcyFh6ZIcYxxmqiaDSYxhOhFUsqngi3Fzcj3ljdYDN"
-      "E9uzA1YD/5MhnzW1KRqF7mYG8jFYXLcfLpjOe2LA0fuGq"
-      "QrQHl10sdK0sFcFSOSlzF0BgXQH9h3QZDBI0ccNEhftjX"
-      "uippBDD2/eMRiETmwwNEYHyqhdDyo22w+3QHuNbdve5a7"
-      "eOkHmDVJ0ixNmfbz1h0qo/Q6GuSB2wQJQbpOjOQAl7woW"
-      "SRJ0m2ewhvAOUiYYtZtaZL0CZZmtmVOQttLfr/dbveLZo"
-      "drfrL7W75wG/JjqkQxoNTtNsTKELQpQL6/D5loaSmyTT8"
-      "TUhsmi8iFA0hZiyltf7OiNKdarRm5w2So2lTNdPLuIzR+"
-      "AiLj8VTRJaj0LmX4VhJ27f/VJV/yycilWPOrk8NkXi7Qq"
-      "mj5bHqVZlJKZIRk1wFzKrt0WUbnXMPJ1fk4TJ5oWBA61p"
-      "1V76DeIs0MX+s3GxRlA1vtw83KhgNphc1nyErLO5zcvbO"
-      "srq+scbZnpzc6QVFPenLwGxmC+BOfYI+DN55QYddh4Q/N"
-      "E/yGYYj4TOGNngQavAZnzzTovEA+kcMJ+247uYexNA+4F"
-      "svjmuv662jsWxPZx2xg890bYMYnTgya7bjmCiEY0qgJ0v"
-      "MF3c+NoFdPyzxz6V3Uxs3AOWCDchRvOsQtBrbFsrT2fhH"
-      "Ec7ByGzu/dA4IO0A3HdfeP9yMqAwP6NPEb6cbwn0PWVU1"
-      "7/FDBQh/CPIrbfcg027IZrsAT/Bf3FNWyn9RSR4cvvwn3"
-      "e4HFmYPDl/thYcRVi8qPEoXVUWBl6FTBFTtnqmKKg5wnl"
-      "F4wZ1yeLv7TiwXKektE+iDBNicWEyLpnFhfDkpJc3q2kh"
-      "SPyQBbE0dMJnOoDzTwGsI7cdyMkL5gWqUjCF6Txst/twx"
-      "Cv1WzzHoy21ZDQ1xnuDzdPDWR4knr14v0tYn3IxaMFFdi"
-      "MOlEOJHw1jOQ4sWt5rQopRkXZhMEi7pmeDCVWBlfUKwhM"
-      "Z7rsF6elKsvbwiKxgxIdewa3ErsaYomCVZFYJb0GUu3Jq"
-      "GUNoplBxYiYby8vLBFWef+Cri4/I1sbQ/1OtYTrNtdXS+"
-      "rSe7kQ52eSObL99/iErCWUjCy5W4JLygmCouGfG9x9fmx"
-      "17XhBuDCaOerbt538erta7TFktLvdHghZcCbcPQO33zIJ"
-      "G9kxF5hoVXnzTzRz0r5js8oTj6uyPkGRf346HOLcasgFe"
-      "xueNUWFPtuFKzjoSFYYedhwVlhsRVYWWJpltv1XPQT1Rl"
-      "0bjZIBlb1XujVDzY/Kj4k6Ku3+Z0jo1owjVzDpFTXe1ju"
-      "vBSWNFmNWGZy8LvzUl5PN4JCwyNDzbQ0aAj4Zrjz0FatG"
-      "JJYhvq4j7mGSpvytGFlZtHf2C4o/28Zu8z7wo7eYPfXys"
-      "nF0i9NnPh1t1zR7VBb9GqaOXhtTmHQdgMFXE+Z608cnpO"
-      "DdZdjL+TuDY44Q38kJXHhccWLoOd9uv1AwwvO+48uu+fa"
-      "CSJPJ1bmy6ThyvpivBmYWgjxPDPAp7JTemY/yGKFEiRt/"
-      "jG/2P79s8KCwoLCgoLC/khUBA5F0SfQZ+RYfpNE/4Xosm"
-      "q7jsZAJsAAAAASUVORK5CYII=">>;
-image_base64(<<"vcss.png">>) ->
-    <<"iVBORw0KGgoAAAANSUhEUgAAAFgAAAAfCAMAAABUFvrSA"
-      "AABKVBMVEUAAAAjIx8MR51ZVUqAdlmdnZ3ejEWLDAuNjY"
-      "1kiMG0n2d9fX19Ghfrp1FtbW3y39+3Ph6lIRNdXV2qJBF"
-      "cVUhcVUhPT0/dsmpUfLr57+/u7u4/PDWZAACZAADOp1Gd"
-      "GxG+SyTgvnNdSySzk16+mkuxw+BOS0BOS0DOzs7MzMy4T"
-      "09RRDwsJBG+vr73wV6fkG6eCQRFcLSurq6/X1+ht9nXfz"
-      "5sepHuwV59ZTHetFjQ2+wMCQQ2ZK5tWCsmWajsz8+Sq9N"
-      "MPh4hVaY8MRj///////////////////////9MTEyOp9Lu"
-      "8vhXU1A8PDyjOSTBz+YLRJ2rLy8sLCwXTaKujEUcHByDn"
-      "82dfz7/zGafDw+fDw+zRSlzlMcMDAyNcji1tbXf5vIcFg"
-      "vATJOjAAAAY3RSTlP/8/////////////////8A//////P"
-      "/////ov//8//////////////z///T//////////+i////"
-      "//////////8w/////6IA/xAgMP//////////8////////"
-      "/8w0/////////+zehebAAACkUlEQVR42u2VfVPTQBDG19"
-      "VqC6LY+lKrRIxFQaFSBPuSvhBPF8SIUZK2J5Yav/+HcO8"
-      "uZdLqTCsU/nKnyWwvk1/unnt2D9ZmH+8/cMAaTRFy+ng6"
-      "9/yiwC/+gy8R3McGv5zHvGJEGAdR4eBgi1IbZwevIEZE2"
-      "4pFtBtzG1Q4AoD5zvw5pEDcJvIQV/TE3/l+H9GnNJwcdA"
-      "BS5wAbFQLMqI98/UReoAaOTlaJsp0zaHx7LwZvY0BUR2x"
-      "pWTzqam0gzY8KGzG4MhBCNGucha4QbpETy+Yk/BP85nt7"
-      "34AjpQLTsE4ZFpf/dnkUCglXVNYB+OfUZJHvAqAoa45Oe"
-      "uPgm4+Xjtv7xm4N7PMV4C61+Mrz3H2WImm3ATiWrAiwZR"
-      "WcUA5Ej4dgIEMxDv6yxHHcNuAutnjv2HZ1NeuycoVPh0m"
-      "wC834zZC9Ao5dkZZKwLVGwT+WdLw0YOZ1saEkUDoT+QGW"
-      "KZ0E2xpcrPakVW2KXwyUtYEtlEAj3GXD/fYwrryAdeiyG"
-      "qidQSw1eqtJcA8cZq4zXqhPuCBYE1fKJjh/5X6MwRm9c2"
-      "xf7WVdLf5oSdt64esVIwVAKC1HJ2oli8vj3L0YzC4zjkM"
-      "agt+arDAs6bApbL1RVlWIqrJbreqKZmh4y6VR7rAJeUYD"
-      "VRj9VqRXkErpJ9lbEwtE83KlIfeG4p52t7zWIMO1XcaGz"
-      "54uUyet+hBM7BXXDS8Xc5+8Gmmbu1xwSoGIokA3oTptQe"
-      "cQ4Iimm/Ew7jwbPfMi3TM91T9XVIGo+W9xC8oWpugVCXL"
-      "uwXijjxJ3r/6PjX7nlFua8QmyM+TO/Gja2TTc2Z95C5ua"
-      "ewGH6cJi6bJO6Z+TY276eH3tbgy+/3ly3Js+rj66osG/A"
-      "V5htgaQ9SeRAAAAAElFTkSuQmCC">>;
-image_base64(<<"powered-by-ejabberd.png">>) ->
-    <<"iVBORw0KGgoAAAANSUhEUgAAAGUAAAAfCAMAAADJG/NaA"
-      "AAAw1BMVEUAAAAjBgYtBAM5AwFCAAAYGAJNAABcAABIDQ"
-      "5qAAAoJRV7AACFAAAoKSdJHByLAAAwLwk1NQA1MzFJKyo"
-      "4NxtDQQBEQT5KSCxSTgBSUBlgQ0JYSEpZWQJPUU5hYABb"
-      "W0ZiYClcW1poaCVwbQRpaDhzYWNsakhuZ2VrbFZ8dwCEg"
-      "AB3dnd4d2+OjACDhYKcmACJi4iQkpWspgCYmJm5swCmqa"
-      "zEwACwsbS4ub3X0QLExsPLyszW1Nnc3ODm5ugMBwAWAwP"
-      "Hm1IFAAAAAXRSTlMAQObYZgAAAAFiS0dEAIgFHUgAAAAJ"
-      "cEhZcwAACxMAAAsTAQCanBgAAAAHdElNRQfVCRQOBA7VB"
-      "kCMAAACcElEQVRIx72WjXKiMBSFQalIFbNiy1pdrJZaRV"
-      "YR5deGwPs/VRNBSBB2OjvQO0oYjPfj5J6bCcdx8i2Uldx"
-      "KcDhk1HbIPwFBF/kHKJfjPSVAyIRHF9rRZ4sUX3EDdWOv"
-      "1+u2tESaavpnYTbv9zvd0WwDy3/QcGQXlH5uTxB1l07MJ"
-      "lRpsUei0JF6Qi+OHyGK7ijXxPklHe/umIllim3iUBMJDI"
-      "EULxxPP0TVWhhKJoN9fUpdmQLteV8aDgEAg9gIcTjL4F4"
-      "L+r4WVKEF+rbJdwYYAoQHY+oQjnGootyKwxapoi73WkyF"
-      "FySQBv988naEEp4+YMMec5VUCQDJTscEy7Kc0HsLmqNE7"
-      "rovDjMpIHHGYeidXn4TQcaxMYqP3RV3C8oCl2WvrlSPaN"
-      "pGZadRnmPGCk8ylM2okAJ4i9TEe1KersXxSl6jUt5uayi"
-      "IodirtcKLOaWblj50wiyMv1F9lm9TUDArGAD0FmEpvCUs"
-      "VoZy6dW81Fg0aDaHogQa36ekAPG5DDGsbdZrGsrzZUnzv"
-      "Bo1I2tLmuL69kSitAweyHKN9b3leDfQMnu3nIIKWfmXnq"
-      "GVKedJT6QpICbJvf2f8aOsvn68v+k7/cwUQdPoxaMoRTn"
-      "KFHNlKsKQphCTOa84u64vpi8bH31CqsbF6lSONRTkTyQG"
-      "Arq49/fEvjBwz4eDS2/JpaXRNOoXRD/VmOrDVTJJRIZCT"
-      "Lav3VrqbPvP3vdduGEhQJzilncbpSA4F3vsihErO+dayv"
-      "/sY5/yRE0GDEXCu2VoNiMlo5i+P2KlgMEvTNk2eYa5XEy"
-      "h12Ex17Z8vzQUR3KEPbYd6XG87eC4Ly75RneS5ZYHAAAA"
-      "AElFTkSuQmCC">>.
+%% base64:encode(F1b).
 
 create_image_files(Images_dir) ->
     Filenames = [<<"powered-by-ejabberd.png">>,
 		 <<"powered-by-erlang.png">>, <<"valid-xhtml10.png">>,
 		 <<"vcss.png">>],
-    lists:foreach(fun (Filename) ->
-			  Filename_full = fjoin([Images_dir, Filename]),
-			  {ok, F} = file:open(Filename_full, [write]),
-			  Image = jlib:decode_base64(image_base64(Filename)),
-			  io:format(F, <<"~s">>, [Image]),
-			  file:close(F)
-		  end,
-		  Filenames),
-    ok.
+    lists:foreach(
+      fun(Filename) ->
+	      Src = filename:join([misc:img_dir(), Filename]),
+	      Dst = fjoin([Images_dir, Filename]),
+	      case file:copy(Src, Dst) of
+		  {ok, _} -> ok;
+		  {error, Why} ->
+		      ?ERROR_MSG("Failed to copy ~s to ~s",
+				 [Src, Dst, file:format_error(Why)])
+	      end
+      end, Filenames).
 
 fw(F, S) -> fw(F, S, [], html).
 
@@ -779,7 +525,7 @@ fw(F, S, FileFormat) when is_atom(FileFormat) ->
     fw(F, S, [], FileFormat).
 
 fw(F, S, O, FileFormat) ->
-    S1 = list_to_binary(io_lib:format(binary_to_list(S) ++ "~n", O)),
+    S1 = (str:format(binary_to_list(S) ++ "~n", O)),
     S2 = case FileFormat of
 	     html ->
 		 S1;
@@ -857,77 +603,10 @@ put_header(F, Room, Date, CSSFile, Lang, Hour_offset,
 put_header_css(F, false) ->
     fw(F, <<"<style type=\"text/css\">">>),
     fw(F, <<"<!--">>),
-    fw(F,
-       <<".ts {color: #AAAAAA; text-decoration: "
-	 "none;}">>),
-    fw(F,
-       <<".mrcm {color: #009900; font-style: italic; "
-	 "font-weight: bold;}">>),
-    fw(F,
-       <<".msc {color: #009900; font-style: italic; "
-	 "font-weight: bold;}">>),
-    fw(F,
-       <<".msm {color: #000099; font-style: italic; "
-	 "font-weight: bold;}">>),
-    fw(F, <<".mj {color: #009900; font-style: italic;}">>),
-    fw(F, <<".ml {color: #009900; font-style: italic;}">>),
-    fw(F, <<".mk {color: #009900; font-style: italic;}">>),
-    fw(F, <<".mb {color: #009900; font-style: italic;}">>),
-    fw(F, <<".mnc {color: #009900; font-style: italic;}">>),
-    fw(F, <<".mn {color: #0000AA;}">>),
-    fw(F, <<".mne {color: #AA0099;}">>),
-    fw(F,
-       <<"a.nav {color: #AAAAAA; font-family: "
-	 "monospace; letter-spacing: 3px; text-decorati"
-	 "on: none;}">>),
-    fw(F,
-       <<"div.roomtitle {border-bottom: #224466 "
-	 "solid 3pt; margin-left: 20pt;}">>),
-    fw(F,
-       <<"div.roomtitle {color: #336699; font-size: "
-	 "24px; font-weight: bold; font-family: "
-	 "sans-serif; letter-spacing: 3px; text-decorat"
-	 "ion: none;}">>),
-    fw(F,
-       <<"a.roomjid {color: #336699; font-size: "
-	 "24px; font-weight: bold; font-family: "
-	 "sans-serif; letter-spacing: 3px; margin-left: "
-	 "20pt; text-decoration: none;}">>),
-    fw(F,
-       <<"div.logdate {color: #663399; font-size: "
-	 "20px; font-weight: bold; font-family: "
-	 "sans-serif; letter-spacing: 2px; border-botto"
-	 "m: #224466 solid 1pt; margin-left:80pt; "
-	 "margin-top:20px;}">>),
-    fw(F,
-       <<"div.roomsubject {color: #336699; font-size: "
-	 "18px; font-family: sans-serif; margin-left: "
-	 "80pt; margin-bottom: 10px;}">>),
-    fw(F,
-       <<"div.rc {color: #336699; font-size: 12px; "
-	 "font-family: sans-serif; margin-left: "
-	 "50%; text-align: right; background: "
-	 "#f3f6f9; border-bottom: 1px solid #336699; "
-	 "border-right: 4px solid #336699;}">>),
-    fw(F,
-       <<"div.rct {font-weight: bold; background: "
-	 "#e3e6e9; padding-right: 10px;}">>),
-    fw(F, <<"div.rcos {padding-right: 10px;}">>),
-    fw(F, <<"div.rcoe {color: green;}">>),
-    fw(F, <<"div.rcod {color: red;}">>),
-    fw(F, <<"div.rcoe:after {content: \": v\";}">>),
-    fw(F, <<"div.rcod:after {content: \": x\";}">>),
-    fw(F, <<"div.rcot:after {}">>),
-    fw(F,
-       <<".legend {width: 100%; margin-top: 30px; "
-	 "border-top: #224466 solid 1pt;  padding: "
-	 "10px 0px 10px 0px; text-align: left; "
-	 "font-family: monospace; letter-spacing: "
-	 "2px;}">>),
-    fw(F,
-       <<".w3c {position: absolute; right: 10px; "
-	 "width: 60%; text-align: right; font-family: "
-	 "monospace; letter-spacing: 1px;}">>),
+    case misc:read_css("muc.css") of
+	{ok, Data} -> fw(F, Data);
+	{error, _} -> ok
+    end,
     fw(F, <<"//-->">>),
     fw(F, <<"</style>">>);
 put_header_css(F, CSSFile) ->
@@ -938,22 +617,16 @@ put_header_css(F, CSSFile) ->
 
 put_header_script(F) ->
     fw(F, <<"<script type=\"text/javascript\">">>),
-    fw(F, <<"function sh(e) // Show/Hide an element">>),
-    fw(F,
-       <<"{if(document.getElementById(e).style.display="
-	 "='none')">>),
-    fw(F,
-       <<"{document.getElementById(e).style.display='bl"
-	 "ock';}">>),
-    fw(F,
-       <<"else {document.getElementById(e).style.displa"
-	 "y='none';}}">>),
+    case misc:read_js("muc.js") of
+	{ok, Data} -> fw(F, Data);
+	{error, _} -> ok
+    end,
     fw(F, <<"</script>">>).
 
 put_room_config(_F, _RoomConfig, _Lang, plaintext) ->
     ok;
 put_room_config(F, RoomConfig, Lang, _FileFormat) ->
-    {_, Now2, _} = now(),
+    {_, Now2, _} = p1_time_compat:timestamp(),
     fw(F, <<"<div class=\"rc\">">>),
     fw(F,
        <<"<div class=\"rct\" onclick=\"sh('a~p');return "
@@ -970,7 +643,7 @@ put_room_occupants(_F, _RoomOccupants, _Lang,
     ok;
 put_room_occupants(F, RoomOccupants, Lang,
 		   _FileFormat) ->
-    {_, Now2, _} = now(),
+    {_, Now2, _} = p1_time_compat:timestamp(),
 %% htmlize
 %% The default behaviour is to ignore the nofollow spam prevention on links
 %% (NoFollow=false)
@@ -1041,7 +714,7 @@ get_room_info(RoomJID, Opts) ->
 	      false -> <<"">>
 	    end,
     Subject = case lists:keysearch(subject, 1, Opts) of
-		{value, {_, S}} -> S;
+		{value, {_, S}} -> xmpp:get_text(S);
 		false -> <<"">>
 	      end,
     SubjectAuthor = case lists:keysearch(subject_author, 1,
@@ -1050,7 +723,7 @@ get_room_info(RoomJID, Opts) ->
 		      {value, {_, SA}} -> SA;
 		      false -> <<"">>
 		    end,
-    #room{jid = jlib:jid_to_string(RoomJID), title = Title,
+    #room{jid = jid:encode(RoomJID), title = Title,
 	  subject = Subject, subject_author = SubjectAuthor,
 	  config = Opts}.
 
@@ -1063,10 +736,9 @@ roomconfig_to_string(Options, Lang, FileFormat) ->
     Os2 = lists:sort(Os1),
     Options2 = Title ++ Os2,
     lists:foldl(fun ({Opt, Val}, R) ->
-			case get_roomconfig_text(Opt) of
+			case get_roomconfig_text(Opt, Lang) of
 			  undefined -> R;
-			  OptT ->
-			      OptText = (?T(OptT)),
+			  OptText ->
 			      R2 = case Val of
 				     false ->
 					 <<"<div class=\"rcod\">",
@@ -1085,7 +757,7 @@ roomconfig_to_string(Options, Lang, FileFormat) ->
 					   max_users ->
 					       <<"<div class=\"rcot\">",
 						 OptText/binary, ": \"",
-						 (htmlize(jlib:integer_to_binary(T),
+						 (htmlize(integer_to_binary(T),
 							  FileFormat))/binary,
 						 "\"</div>">>;
 					   title ->
@@ -1103,7 +775,7 @@ roomconfig_to_string(Options, Lang, FileFormat) ->
 					   allow_private_messages_from_visitors ->
 					       <<"<div class=\"rcot\">",
 						 OptText/binary, ": \"",
-						 (htmlize(?T((jlib:atom_to_binary(T))),
+						 (htmlize(?T(misc:atom_to_binary(T)),
 							  FileFormat))/binary,
 						 "\"</div>">>;
 					   _ -> <<"\"", T/binary, "\"">>
@@ -1114,49 +786,49 @@ roomconfig_to_string(Options, Lang, FileFormat) ->
 		end,
 		<<"">>, Options2).
 
-get_roomconfig_text(title) -> <<"Room title">>;
-get_roomconfig_text(persistent) ->
-    <<"Make room persistent">>;
-get_roomconfig_text(public) ->
-    <<"Make room public searchable">>;
-get_roomconfig_text(public_list) ->
-    <<"Make participants list public">>;
-get_roomconfig_text(password_protected) ->
-    <<"Make room password protected">>;
-get_roomconfig_text(password) -> <<"Password">>;
-get_roomconfig_text(anonymous) ->
-    <<"This room is not anonymous">>;
-get_roomconfig_text(members_only) ->
-    <<"Make room members-only">>;
-get_roomconfig_text(moderated) ->
-    <<"Make room moderated">>;
-get_roomconfig_text(members_by_default) ->
-    <<"Default users as participants">>;
-get_roomconfig_text(allow_change_subj) ->
-    <<"Allow users to change the subject">>;
-get_roomconfig_text(allow_private_messages) ->
-    <<"Allow users to send private messages">>;
-get_roomconfig_text(allow_private_messages_from_visitors) ->
-    <<"Allow visitors to send private messages to">>;
-get_roomconfig_text(allow_query_users) ->
-    <<"Allow users to query other users">>;
-get_roomconfig_text(allow_user_invites) ->
-    <<"Allow users to send invites">>;
-get_roomconfig_text(logging) -> <<"Enable logging">>;
-get_roomconfig_text(allow_visitor_nickchange) ->
-    <<"Allow visitors to change nickname">>;
-get_roomconfig_text(allow_visitor_status) ->
-    <<"Allow visitors to send status text in "
-      "presence updates">>;
-get_roomconfig_text(captcha_protected) ->
-    <<"Make room captcha protected">>;
-get_roomconfig_text(description) ->
-    <<"Room description">>;
-%% get_roomconfig_text(subject) ->  "Subject";
-%% get_roomconfig_text(subject_author) ->  "Subject author";
-get_roomconfig_text(max_users) ->
-    <<"Maximum Number of Occupants">>;
-get_roomconfig_text(_) -> undefined.
+get_roomconfig_text(title, Lang) -> ?T(<<"Room title">>);
+get_roomconfig_text(persistent, Lang) ->
+    ?T(<<"Make room persistent">>);
+get_roomconfig_text(public, Lang) ->
+    ?T(<<"Make room public searchable">>);
+get_roomconfig_text(public_list, Lang) ->
+    ?T(<<"Make participants list public">>);
+get_roomconfig_text(password_protected, Lang) ->
+    ?T(<<"Make room password protected">>);
+get_roomconfig_text(password, Lang) -> ?T(<<"Password">>);
+get_roomconfig_text(anonymous, Lang) ->
+    ?T(<<"This room is not anonymous">>);
+get_roomconfig_text(members_only, Lang) ->
+    ?T(<<"Make room members-only">>);
+get_roomconfig_text(moderated, Lang) ->
+    ?T(<<"Make room moderated">>);
+get_roomconfig_text(members_by_default, Lang) ->
+    ?T(<<"Default users as participants">>);
+get_roomconfig_text(allow_change_subj, Lang) ->
+    ?T(<<"Allow users to change the subject">>);
+get_roomconfig_text(allow_private_messages, Lang) ->
+    ?T(<<"Allow users to send private messages">>);
+get_roomconfig_text(allow_private_messages_from_visitors, Lang) ->
+    ?T(<<"Allow visitors to send private messages to">>);
+get_roomconfig_text(allow_query_users, Lang) ->
+    ?T(<<"Allow users to query other users">>);
+get_roomconfig_text(allow_user_invites, Lang) ->
+    ?T(<<"Allow users to send invites">>);
+get_roomconfig_text(logging, Lang) -> ?T(<<"Enable logging">>);
+get_roomconfig_text(allow_visitor_nickchange, Lang) ->
+    ?T(<<"Allow visitors to change nickname">>);
+get_roomconfig_text(allow_visitor_status, Lang) ->
+    ?T(<<"Allow visitors to send status text in "
+      "presence updates">>);
+get_roomconfig_text(captcha_protected, Lang) ->
+    ?T(<<"Make room CAPTCHA protected">>);
+get_roomconfig_text(description, Lang) ->
+    ?T(<<"Room description">>);
+%% get_roomconfig_text(subject, Lang) ->  "Subject";
+%% get_roomconfig_text(subject_author, Lang) ->  "Subject author";
+get_roomconfig_text(max_users, Lang) ->
+    ?T(<<"Maximum Number of Occupants">>);
+get_roomconfig_text(_, _) -> undefined.
 
 %% Users = [{JID, Nick, Role}]
 roomoccupants_to_string(Users, _FileFormat) ->
@@ -1165,10 +837,7 @@ roomoccupants_to_string(Users, _FileFormat) ->
 	      Users1 /= []],
     iolist_to_binary([<<"<div class=\"rcot\">">>, Res, <<"</div>">>]).
 
-%% Users = [{JID, Nick, Role}]
 group_by_role(Users) ->
-%% Role = atom()
-%% Users = [{JID, Nick}]
     {Ms, Ps, Vs, Ns} = lists:foldl(fun ({JID, Nick,
 					 moderator},
 					{Mod, Par, Vis, Non}) ->
@@ -1214,36 +883,35 @@ role_users_to_string(RoleS, Users) ->
     <<RoleS/binary, ": ", UsersString/binary>>.
 
 get_room_occupants(RoomJIDString) ->
-    RoomJID = jlib:string_to_jid(RoomJIDString),
+    RoomJID = jid:decode(RoomJIDString),
     RoomName = RoomJID#jid.luser,
     MucService = RoomJID#jid.lserver,
     StateData = get_room_state(RoomName, MucService),
     [{U#user.jid, U#user.nick, U#user.role}
      || {_, U} <- (?DICT):to_list(StateData#state.users)].
 
--spec get_room_state(binary(), binary()) -> muc_room_state().
+-spec get_room_state(binary(), binary()) -> mod_muc_room:state().
 
 get_room_state(RoomName, MucService) ->
-    case mnesia:dirty_read(muc_online_room,
-			   {RoomName, MucService})
-	of
-      [R] ->
-	  RoomPid = R#muc_online_room.pid,
+    case mod_muc:find_online_room(RoomName, MucService) of
+	{ok, RoomPid} ->
 	  get_room_state(RoomPid);
-      [] -> #state{}
+	error ->
+	    #state{}
     end.
 
--spec get_room_state(pid()) -> muc_room_state().
+-spec get_room_state(pid()) -> mod_muc_room:state().
 
 get_room_state(RoomPid) ->
-    {ok, R} = gen_fsm:sync_send_all_state_event(RoomPid,
+    {ok, R} = p1_fsm:sync_send_all_state_event(RoomPid,
 						get_state),
     R.
 
-get_proc_name(Host) -> gen_mod:get_module_proc(Host, ?PROCNAME).
+get_proc_name(Host) ->
+    gen_mod:get_module_proc(Host, ?MODULE).
 
 calc_hour_offset(TimeHere) ->
-    TimeZero = calendar:now_to_universal_time(now()),
+    TimeZero = calendar:universal_time(),
     TimeHereHour =
 	calendar:datetime_to_gregorian_seconds(TimeHere) div
 	  3600,
@@ -1255,9 +923,18 @@ calc_hour_offset(TimeHere) ->
 fjoin(FileList) ->
     list_to_binary(filename:join([binary_to_list(File) || File <- FileList])).
 
+has_no_permanent_store_hint(Packet) ->
+    xmpp:has_subtag(Packet, #hint{type = 'no-store'}) orelse
+    xmpp:has_subtag(Packet, #hint{type = 'no-storage'}) orelse
+    xmpp:has_subtag(Packet, #hint{type = 'no-permanent-store'}) orelse
+    xmpp:has_subtag(Packet, #hint{type = 'no-permanent-storage'}).
+
 mod_opt_type(access_log) ->
-    fun (A) when is_atom(A) -> A end;
-mod_opt_type(cssfile) -> fun iolist_to_binary/1;
+    fun acl:access_rules_validator/1;
+mod_opt_type(cssfile) ->
+    fun(false) -> false;
+       (File) -> misc:try_read_file(File)
+    end;
 mod_opt_type(dirname) ->
     fun (room_jid) -> room_jid;
 	(room_name) -> room_name
@@ -1272,11 +949,13 @@ mod_opt_type(file_format) ->
     end;
 mod_opt_type(file_permissions) ->
     fun (SubOpts) ->
-	    F = fun ({mode, Mode}, {_M, G}) -> {Mode, G};
-		    ({group, Group}, {M, _G}) -> {M, Group}
-		end,
-	    lists:foldl(F, {644, 33}, SubOpts)
+	    {proplists:get_value(mode, SubOpts, 644),
+	     proplists:get_value(group, SubOpts, 33)}
     end;
+mod_opt_type({file_permissions, mode}) ->
+    fun(I) when is_integer(I), I>=0 -> I end;
+mod_opt_type({file_permissions, group}) ->
+    fun(I) when is_integer(I), I>=0 -> I end;
 mod_opt_type(outdir) -> fun iolist_to_binary/1;
 mod_opt_type(spam_prevention) ->
     fun (B) when is_boolean(B) -> B end;
@@ -1287,11 +966,18 @@ mod_opt_type(timezone) ->
 mod_opt_type(top_link) ->
     fun ([{S1, S2}]) ->
 	    {iolist_to_binary(S1), iolist_to_binary(S2)}
-    end;
-mod_opt_type(_) ->
-    [access_log, cssfile, dirname, dirtype, file_format,
-     file_permissions, outdir, spam_prevention, timezone,
-     top_link].
+    end.
 
-opt_type(language) -> fun iolist_to_binary/1;
-opt_type(_) -> [language].
+mod_options(_) ->
+    [{access_log, muc_admin},
+     {cssfile, false},
+     {dirname, room_jid},
+     {dirtype, subdirs},
+     {file_format, html},
+     {file_permissions,
+      [{mode, 644},
+       {group, 33}]},
+     {outdir, <<"www/muc">>},
+     {spam_prevention, true},
+     {timezone, local},
+     {top_link, [{<<"/">>, <<"Home">>}]}].

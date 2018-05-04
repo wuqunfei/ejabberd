@@ -1,11 +1,8 @@
-%%%----------------------------------------------------------------------
-%%% File    : ejabberd_service.erl
-%%% Author  : Alexey Shchepin <alexey@process-one.net>
-%%% Purpose : External component management (XEP-0114)
-%%% Created :  6 Dec 2002 by Alexey Shchepin <alexey@process-one.net>
+%%%-------------------------------------------------------------------
+%%% Created : 11 Dec 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2015   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -21,359 +18,251 @@
 %%% with this program; if not, write to the Free Software Foundation, Inc.,
 %%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 %%%
-%%%----------------------------------------------------------------------
-
+%%%-------------------------------------------------------------------
 -module(ejabberd_service).
-
--behaviour(ejabberd_config).
-
--author('alexey@process-one.net').
+-behaviour(xmpp_stream_in).
+-behaviour(xmpp_socket).
 
 -protocol({xep, 114, '1.6'}).
 
--define(GEN_FSM, p1_fsm).
-
--behaviour(?GEN_FSM).
-
-%% External exports
--export([start/2, start_link/2, send_text/2,
-	 send_element/2, socket_type/0, transform_listen_option/2]).
-
--export([init/1, wait_for_stream/2,
-	 wait_for_handshake/2, stream_established/2,
-	 handle_event/3, handle_sync_event/4, code_change/4,
-	 handle_info/3, terminate/3, print_state/1, opt_type/1]).
+%% xmpp_socket callbacks
+-export([start/2, start_link/2, socket_type/0, close/1, close/2]).
+%% ejabberd_listener callbacks
+-export([listen_opt_type/1, transform_listen_option/2]).
+%% xmpp_stream_in callbacks
+-export([init/1, handle_info/2, terminate/2, code_change/3]).
+-export([handle_stream_start/2, handle_auth_success/4, handle_auth_failure/4,
+	 handle_authenticated_packet/2, get_password_fun/1, tls_options/1]).
+%% API
+-export([send/2]).
 
 -include("ejabberd.hrl").
+-include("xmpp.hrl").
 -include("logger.hrl").
 
--include("jlib.hrl").
+-type state() :: map().
+-export_type([state/0]).
 
--record(state,
-	{socket                    :: ejabberd_socket:socket_state(),
-         sockmod = ejabberd_socket :: ejabberd_socket | ejabberd_frontend_socket,
-         streamid = <<"">>         :: binary(),
-         hosts = []                :: [binary()],
-         password = <<"">>         :: binary(),
-         access                    :: atom(),
-	 check_from = true         :: boolean()}).
-
-%-define(DBGFSM, true).
-
--ifdef(DBGFSM).
-
--define(FSMOPTS, [{debug, [trace]}]).
-
--else.
-
--define(FSMOPTS, []).
-
--endif.
-
--define(STREAM_HEADER,
-	<<"<?xml version='1.0'?><stream:stream "
-	  "xmlns:stream='http://etherx.jabber.org/stream"
-	  "s' xmlns='jabber:component:accept' id='~s' "
-	  "from='~s'>">>).
-
--define(STREAM_TRAILER, <<"</stream:stream>">>).
-
--define(INVALID_HEADER_ERR,
-	<<"<stream:stream xmlns:stream='http://etherx.ja"
-	  "bber.org/streams'><stream:error>Invalid "
-	  "Stream Header</stream:error></stream:stream>">>).
-
--define(INVALID_HANDSHAKE_ERR,
-	<<"<stream:error><not-authorized xmlns='urn:ietf"
-	  ":params:xml:ns:xmpp-streams'/><text "
-	  "xmlns='urn:ietf:params:xml:ns:xmpp-streams' "
-	  "xml:lang='en'>Invalid Handshake</text></strea"
-	  "m:error></stream:stream>">>).
-
--define(INVALID_XML_ERR,
-	xml:element_to_binary(?SERR_XML_NOT_WELL_FORMED)).
-
--define(INVALID_NS_ERR,
-	xml:element_to_binary(?SERR_INVALID_NAMESPACE)).
-
-%%%----------------------------------------------------------------------
+%%%===================================================================
 %%% API
-%%%----------------------------------------------------------------------
+%%%===================================================================
 start(SockData, Opts) ->
-    supervisor:start_child(ejabberd_service_sup,
-			   [SockData, Opts]).
+    xmpp_stream_in:start(?MODULE, [SockData, Opts],
+			 ejabberd_config:fsm_limit_opts(Opts)).
 
 start_link(SockData, Opts) ->
-    (?GEN_FSM):start_link(ejabberd_service,
-			  [SockData, Opts], fsm_limit_opts(Opts) ++ (?FSMOPTS)).
+    xmpp_stream_in:start_link(?MODULE, [SockData, Opts],
+			      ejabberd_config:fsm_limit_opts(Opts)).
 
-socket_type() -> xml_stream.
+socket_type() ->
+    xml_stream.
 
-%%%----------------------------------------------------------------------
-%%% Callback functions from gen_fsm
-%%%----------------------------------------------------------------------
+-spec send(pid(), xmpp_element()) -> ok;
+	  (state(), xmpp_element()) -> state().
+send(Stream, Pkt) ->
+    xmpp_stream_in:send(Stream, Pkt).
 
-%%----------------------------------------------------------------------
-%% Func: init/1
-%% Returns: {ok, StateName, StateData}          |
-%%          {ok, StateName, StateData, Timeout} |
-%%          ignore                              |
-%%          {stop, StopReason}
-%%----------------------------------------------------------------------
-init([{SockMod, Socket}, Opts]) ->
-    ?INFO_MSG("(~w) External service connected", [Socket]),
-    Access = case lists:keysearch(access, 1, Opts) of
-	       {value, {_, A}} -> A;
-	       _ -> all
-	     end,
-    %% This should be improved probably
-    {Hosts, HostOpts} = case lists:keyfind(hosts, 1, Opts) of
-                            {_, HOpts} ->
-                                {[H || {H, _} <- HOpts],
-                                 lists:flatten(
-                                   [O || {_, O} <- HOpts])};
-                            _ ->
-                                {[], []}
-                        end,
-    Password = gen_mod:get_opt(password, HostOpts,
-                               fun iolist_to_binary/1,
-                               p1_sha:sha(crypto:rand_bytes(20))),
-    Shaper = case lists:keysearch(shaper_rule, 1, Opts) of
-	       {value, {_, S}} -> S;
-	       _ -> none
-	     end,
-    CheckFrom = case lists:keysearch(service_check_from, 1,
-				     Opts)
-		    of
-		  {value, {_, CF}} -> CF;
-		  _ -> true
-		end,
-    SockMod:change_shaper(Socket, Shaper),
-    {ok, wait_for_stream,
-     #state{socket = Socket, sockmod = SockMod,
-	    streamid = new_id(), hosts = Hosts, password = Password,
-	    access = Access, check_from = CheckFrom}}.
+-spec close(pid()) -> ok;
+	   (state()) -> state().
+close(Ref) ->
+    xmpp_stream_in:close(Ref).
 
-%%----------------------------------------------------------------------
-%% Func: StateName/2
-%% Returns: {next_state, NextStateName, NextStateData}          |
-%%          {next_state, NextStateName, NextStateData, Timeout} |
-%%          {stop, Reason, NewStateData}
-%%----------------------------------------------------------------------
+-spec close(pid(), atom()) -> ok;
+	   (state(), atom()) -> state().
+close(Ref, Reason) ->
+    xmpp_stream_in:close(Ref, Reason).
 
-wait_for_stream({xmlstreamstart, _Name, Attrs},
-		StateData) ->
-    case xml:get_attr_s(<<"xmlns">>, Attrs) of
-      <<"jabber:component:accept">> ->
-	  To = xml:get_attr_s(<<"to">>, Attrs),
-	  Header = io_lib:format(?STREAM_HEADER,
-				 [StateData#state.streamid, xml:crypt(To)]),
-	  send_text(StateData, Header),
-	  {next_state, wait_for_handshake, StateData};
-      _ ->
-	  send_text(StateData, ?INVALID_HEADER_ERR),
-	  {stop, normal, StateData}
-    end;
-wait_for_stream({xmlstreamerror, _}, StateData) ->
-    Header = io_lib:format(?STREAM_HEADER,
-			   [<<"none">>, ?MYNAME]),
-    send_text(StateData,
-	      <<(list_to_binary(Header))/binary, (?INVALID_XML_ERR)/binary,
-		(?STREAM_TRAILER)/binary>>),
-    {stop, normal, StateData};
-wait_for_stream(closed, StateData) ->
-    {stop, normal, StateData}.
+%%%===================================================================
+%%% xmpp_stream_in callbacks
+%%%===================================================================
+tls_options(#{tls_options := TLSOptions}) ->
+    TLSOptions.
 
-wait_for_handshake({xmlstreamelement, El}, StateData) ->
-    #xmlel{name = Name, children = Els} = El,
-    case {Name, xml:get_cdata(Els)} of
-      {<<"handshake">>, Digest} ->
-	  case p1_sha:sha(<<(StateData#state.streamid)/binary,
-			 (StateData#state.password)/binary>>)
-	      of
-	    Digest ->
-		send_text(StateData, <<"<handshake/>">>),
-		lists:foreach(fun (H) ->
-				      ejabberd_router:register_route(H),
-				      ?INFO_MSG("Route registered for service ~p~n",
-						[H])
-			      end,
-			      StateData#state.hosts),
-		{next_state, stream_established, StateData};
-	    _ ->
-		send_text(StateData, ?INVALID_HANDSHAKE_ERR),
-		{stop, normal, StateData}
-	  end;
-      _ -> {next_state, wait_for_handshake, StateData}
-    end;
-wait_for_handshake({xmlstreamend, _Name}, StateData) ->
-    {stop, normal, StateData};
-wait_for_handshake({xmlstreamerror, _}, StateData) ->
-    send_text(StateData,
-	      <<(?INVALID_XML_ERR)/binary,
-		(?STREAM_TRAILER)/binary>>),
-    {stop, normal, StateData};
-wait_for_handshake(closed, StateData) ->
-    {stop, normal, StateData}.
-
-stream_established({xmlstreamelement, El}, StateData) ->
-    NewEl = jlib:remove_attr(<<"xmlns">>, El),
-    #xmlel{name = Name, attrs = Attrs} = NewEl,
-    From = xml:get_attr_s(<<"from">>, Attrs),
-    FromJID = case StateData#state.check_from of
-		%% If the admin does not want to check the from field
-		%% when accept packets from any address.
-		%% In this case, the component can send packet of
-		%% behalf of the server users.
-		false -> jlib:string_to_jid(From);
-		%% The default is the standard behaviour in XEP-0114
-		_ ->
-		    FromJID1 = jlib:string_to_jid(From),
-		    case FromJID1 of
-		      #jid{lserver = Server} ->
-			  case lists:member(Server, StateData#state.hosts) of
-			    true -> FromJID1;
-			    false -> error
-			  end;
-		      _ -> error
-		    end
+init([State, Opts]) ->
+    Access = proplists:get_value(access, Opts, all),
+    Shaper = proplists:get_value(shaper_rule, Opts, none),
+    GlobalPassword = proplists:get_value(password, Opts, random_password()),
+    HostOpts = proplists:get_value(hosts, Opts, [{global, GlobalPassword}]),
+    HostOpts1 = lists:map(
+		  fun({Host, undefined}) -> {Host, GlobalPassword};
+		     ({Host, Password}) -> {Host, Password}
+		  end, HostOpts),
+    CheckFrom = proplists:get_value(check_from, Opts, true),
+    TLSOpts1 = lists:filter(
+		 fun({certfile, _}) -> true;
+		    ({ciphers, _}) -> true;
+		    ({dhfile, _}) -> true;
+		    ({cafile, _}) -> true;
+		    ({protocol_options, _}) -> true;
+		    (_) -> false
+		 end, Opts),
+    TLSOpts = case proplists:get_bool(tls_compression, Opts) of
+		  false -> [compression_none | TLSOpts1];
+		  true -> TLSOpts1
 	      end,
-    To = xml:get_attr_s(<<"to">>, Attrs),
-    ToJID = case To of
-	      <<"">> -> error;
-	      _ -> jlib:string_to_jid(To)
-	    end,
-    if ((Name == <<"iq">>) or (Name == <<"message">>) or
-	  (Name == <<"presence">>))
-	 and (ToJID /= error)
-	 and (FromJID /= error) ->
-	   ejabberd_router:route(FromJID, ToJID, NewEl);
-       true ->
-	   Err = jlib:make_error_reply(NewEl, ?ERR_BAD_REQUEST),
-	   send_element(StateData, Err),
-	   error
-    end,
-    {next_state, stream_established, StateData};
-stream_established({xmlstreamend, _Name}, StateData) ->
-    {stop, normal, StateData};
-stream_established({xmlstreamerror, _}, StateData) ->
-    send_text(StateData,
-	      <<(?INVALID_XML_ERR)/binary,
-		(?STREAM_TRAILER)/binary>>),
-    {stop, normal, StateData};
-stream_established(closed, StateData) ->
-    {stop, normal, StateData}.
+    GlobalRoutes = proplists:get_value(global_routes, Opts, true),
+    Timeout = ejabberd_config:negotiation_timeout(),
+    State1 = xmpp_stream_in:change_shaper(State, Shaper),
+    State2 = xmpp_stream_in:set_timeout(State1, Timeout),
+    State3 = State2#{access => Access,
+		     xmlns => ?NS_COMPONENT,
+		     lang => ?MYLANG,
+		     server => ?MYNAME,
+		     host_opts => dict:from_list(HostOpts1),
+		     stream_version => undefined,
+		     tls_options => TLSOpts,
+		     global_routes => GlobalRoutes,
+		     check_from => CheckFrom},
+    ejabberd_hooks:run_fold(component_init, {ok, State3}, [Opts]).
 
-%%----------------------------------------------------------------------
-%% Func: StateName/3
-%% Returns: {next_state, NextStateName, NextStateData}            |
-%%          {next_state, NextStateName, NextStateData, Timeout}   |
-%%          {reply, Reply, NextStateName, NextStateData}          |
-%%          {reply, Reply, NextStateName, NextStateData, Timeout} |
-%%          {stop, Reason, NewStateData}                          |
-%%          {stop, Reason, Reply, NewStateData}
-%%----------------------------------------------------------------------
-%state_name(Event, From, StateData) ->
-%    Reply = ok,
-%    {reply, Reply, state_name, StateData}.
+handle_stream_start(_StreamStart,
+		    #{remote_server := RemoteServer,
+		      lang := Lang,
+		      host_opts := HostOpts} = State) ->
+    case ejabberd_router:is_my_host(RemoteServer) of
+	true ->
+	    Txt = <<"Unable to register route on existing local domain">>,
+	    xmpp_stream_in:send(State, xmpp:serr_conflict(Txt, Lang));
+	false ->
+	    NewHostOpts = case dict:is_key(RemoteServer, HostOpts) of
+			      true ->
+				  HostOpts;
+			      false ->
+				  case dict:find(global, HostOpts) of
+				      {ok, GlobalPass} ->
+					  dict:from_list([{RemoteServer, GlobalPass}]);
+				      error ->
+					  HostOpts
+				  end
+			  end,
+	    CodecOpts = ejabberd_config:codec_options(global),
+	    State#{host_opts => NewHostOpts, codec_options => CodecOpts}
+    end.
 
-%%----------------------------------------------------------------------
-%% Func: handle_event/3
-%% Returns: {next_state, NextStateName, NextStateData}          |
-%%          {next_state, NextStateName, NextStateData, Timeout} |
-%%          {stop, Reason, NewStateData}
-%%----------------------------------------------------------------------
-handle_event(_Event, StateName, StateData) ->
-    {next_state, StateName, StateData}.
+get_password_fun(#{remote_server := RemoteServer,
+		   socket := Socket, ip := IP,
+		   host_opts := HostOpts}) ->
+    fun(_) ->
+	    case dict:find(RemoteServer, HostOpts) of
+		{ok, Password} ->
+		    {Password, undefined};
+		error ->
+		    ?INFO_MSG("(~s) Domain ~s is unconfigured for "
+			      "external component from ~s",
+			      [xmpp_socket:pp(Socket), RemoteServer,
+			       ejabberd_config:may_hide_data(misc:ip_to_list(IP))]),
+		    {false, undefined}
+	    end
+    end.
 
-%%----------------------------------------------------------------------
-%% Func: handle_sync_event/4
-%% Returns: {next_state, NextStateName, NextStateData}            |
-%%          {next_state, NextStateName, NextStateData, Timeout}   |
-%%          {reply, Reply, NextStateName, NextStateData}          |
-%%          {reply, Reply, NextStateName, NextStateData, Timeout} |
-%%          {stop, Reason, NewStateData}                          |
-%%          {stop, Reason, Reply, NewStateData}
-%%----------------------------------------------------------------------
-handle_sync_event(_Event, _From, StateName,
-		  StateData) ->
-    Reply = ok, {reply, Reply, StateName, StateData}.
+handle_auth_success(_, Mech, _,
+		    #{remote_server := RemoteServer, host_opts := HostOpts,
+		      socket := Socket, ip := IP,
+		      global_routes := GlobalRoutes} = State) ->
+    ?INFO_MSG("(~s) Accepted external component ~s authentication "
+	      "for ~s from ~s",
+	      [xmpp_socket:pp(Socket), Mech, RemoteServer,
+	       ejabberd_config:may_hide_data(misc:ip_to_list(IP))]),
+    Routes = if GlobalRoutes ->
+		     dict:fetch_keys(HostOpts);
+		true ->
+		     [RemoteServer]
+	     end,
+    lists:foreach(
+      fun(H) ->
+	      ejabberd_router:register_route(H, ?MYNAME),
+	      ejabberd_hooks:run(component_connected, [H])
+      end, Routes),
+    State.
 
-code_change(_OldVsn, StateName, StateData, _Extra) ->
-    {ok, StateName, StateData}.
+handle_auth_failure(_, Mech, Reason,
+		    #{remote_server := RemoteServer,
+		      socket := Socket, ip := IP} = State) ->
+    ?INFO_MSG("(~s) Failed external component ~s authentication "
+	      "for ~s from ~s: ~s",
+	      [xmpp_socket:pp(Socket), Mech, RemoteServer,
+	       ejabberd_config:may_hide_data(misc:ip_to_list(IP)),
+	       Reason]),
+    State.
 
-%%----------------------------------------------------------------------
-%% Func: handle_info/3
-%% Returns: {next_state, NextStateName, NextStateData}          |
-%%          {next_state, NextStateName, NextStateData, Timeout} |
-%%          {stop, Reason, NewStateData}
-%%----------------------------------------------------------------------
-handle_info({send_text, Text}, StateName, StateData) ->
-    send_text(StateData, Text),
-    {next_state, StateName, StateData};
-handle_info({send_element, El}, StateName, StateData) ->
-    send_element(StateData, El),
-    {next_state, StateName, StateData};
-handle_info({route, From, To, Packet}, StateName,
-	    StateData) ->
-    case acl:match_rule(global, StateData#state.access,
-			From)
-	of
-      allow ->
-	  #xmlel{name = Name, attrs = Attrs, children = Els} =
-	      Packet,
-	  Attrs2 =
-	      jlib:replace_from_to_attrs(jlib:jid_to_string(From),
-					 jlib:jid_to_string(To), Attrs),
-	  Text = xml:element_to_binary(#xmlel{name = Name,
-					      attrs = Attrs2, children = Els}),
-	  send_text(StateData, Text);
-      deny ->
-	  Err = jlib:make_error_reply(Packet, ?ERR_NOT_ALLOWED),
-	  ejabberd_router:route_error(To, From, Err, Packet)
-    end,
-    {next_state, StateName, StateData};
-handle_info(Info, StateName, StateData) ->
+handle_authenticated_packet(Pkt0, #{ip := {IP, _}, lang := Lang} = State)
+  when ?is_stanza(Pkt0) ->
+    Pkt = xmpp:put_meta(Pkt0, ip, IP),
+    From = xmpp:get_from(Pkt),
+    case check_from(From, State) of
+	true ->
+        {Pkt2, State2} = ejabberd_hooks:run_fold(component_send_packet, {Pkt, State}, []),
+        case Pkt2 of
+            drop ->
+                ok;
+            _ ->
+                ejabberd_router:route(Pkt2)
+		end,
+        State2;
+	false ->
+	    Txt = <<"Improper domain part of 'from' attribute">>,
+	    Err = xmpp:serr_invalid_from(Txt, Lang),
+	    xmpp_stream_in:send(State, Err)
+    end;
+handle_authenticated_packet(_Pkt, State) ->
+    State.
+
+handle_info({route, Packet}, #{access := Access} = State) ->
+    case acl:match_rule(global, Access, xmpp:get_from(Packet)) of
+	allow ->
+	    xmpp_stream_in:send(State, Packet);
+	deny ->
+	    Lang = xmpp:get_lang(Packet),
+	    Err = xmpp:err_not_allowed(<<"Access denied by service policy">>, Lang),
+	    ejabberd_router:route_error(Packet, Err),
+	    State
+    end;
+handle_info(Info, State) ->
     ?ERROR_MSG("Unexpected info: ~p", [Info]),
-    {next_state, StateName, StateData}.
+    State.
 
-%%----------------------------------------------------------------------
-%% Func: terminate/3
-%% Purpose: Shutdown the fsm
-%% Returns: any
-%%----------------------------------------------------------------------
-terminate(Reason, StateName, StateData) ->
-    ?INFO_MSG("terminated: ~p", [Reason]),
-    case StateName of
-      stream_established ->
-	  lists:foreach(fun (H) ->
-				ejabberd_router:unregister_route(H)
-			end,
-			StateData#state.hosts);
-      _ -> ok
-    end,
-    (StateData#state.sockmod):close(StateData#state.socket),
+terminate(Reason, #{stream_state := StreamState,
+		    host_opts := HostOpts,
+		    remote_server := RemoteServer,
+		    global_routes := GlobalRoutes}) ->
+    case StreamState of
+	established ->
+	    Routes = if GlobalRoutes ->
+			     dict:fetch_keys(HostOpts);
+			true ->
+			     [RemoteServer]
+		     end,
+	    lists:foreach(
+	      fun(H) ->
+		      ejabberd_router:unregister_route(H),
+		      ejabberd_hooks:run(component_disconnected, [H, Reason])
+	      end, Routes);
+	_ ->
+	    ok
+    end;
+terminate(_Reason, _State) ->
     ok.
 
-%%----------------------------------------------------------------------
-%% Func: print_state/1
-%% Purpose: Prepare the state to be printed on error log
-%% Returns: State to print
-%%----------------------------------------------------------------------
-print_state(State) -> State.
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
 
-%%%----------------------------------------------------------------------
+%%%===================================================================
 %%% Internal functions
-%%%----------------------------------------------------------------------
+%%%===================================================================
+-spec check_from(jid(), state()) -> boolean().
+check_from(_From, #{check_from := false}) ->
+    %% If the admin does not want to check the from field
+    %% when accept packets from any address.
+    %% In this case, the component can send packet of
+    %% behalf of the server users.
+    true;
+check_from(From, #{host_opts := HostOpts}) ->
+    %% The default is the standard behaviour in XEP-0114
+    Server = From#jid.lserver,
+    dict:is_key(Server, HostOpts).
 
-send_text(StateData, Text) ->
-    (StateData#state.sockmod):send(StateData#state.socket,
-				   Text).
-
-send_element(StateData, El) ->
-    send_text(StateData, xml:element_to_binary(El)).
-
-new_id() -> randoms:get_string().
+random_password() ->
+    str:sha(randoms:bytes(20)).
 
 transform_listen_option({hosts, Hosts, O}, Opts) ->
     case lists:keyfind(hosts, 1, Opts) of
@@ -393,19 +282,68 @@ transform_listen_option({host, Host, Os}, Opts) ->
 transform_listen_option(Opt, Opts) ->
     [Opt|Opts].
 
-fsm_limit_opts(Opts) ->
-    case lists:keysearch(max_fsm_queue, 1, Opts) of
-        {value, {_, N}} when is_integer(N) ->
-            [{max_queue, N}];
-        _ ->
-            case ejabberd_config:get_option(
-                   max_fsm_queue,
-                   fun(I) when is_integer(I), I > 0 -> I end) of
-                undefined -> [];
-                N -> [{max_queue, N}]
-            end
-    end.
-
-opt_type(max_fsm_queue) ->
-    fun (I) when is_integer(I), I > 0 -> I end;
-opt_type(_) -> [max_fsm_queue].
+-spec listen_opt_type(access) -> fun((any()) -> any());
+		     (shaper_rule) -> fun((any()) -> any());
+		     (certfile) -> fun((binary()) -> binary());
+		     (ciphers) -> fun((binary()) -> binary());
+		     (dhfile) -> fun((binary()) -> binary());
+		     (cafile) -> fun((binary()) -> binary());
+		     (protocol_options) -> fun(([binary()]) -> binary());
+		     (tls_compression) -> fun((boolean()) -> boolean());
+		     (tls) -> fun((boolean()) -> boolean());
+		     (check_from) -> fun((boolean()) -> boolean());
+		     (password) -> fun((boolean()) -> boolean());
+		     (hosts) -> fun(([{binary(), [{password, binary()}]}]) ->
+					   [{binary(), binary() | undefined}]);
+		     (max_stanza_type) -> fun((timeout()) -> timeout());
+		     (max_fsm_queue) -> fun((pos_integer()) -> pos_integer());
+		     (inet) -> fun((boolean()) -> boolean());
+		     (inet6) -> fun((boolean()) -> boolean());
+		     (backlog) -> fun((timeout()) -> timeout());
+		     (atom()) -> [atom()].
+listen_opt_type(access) -> fun acl:access_rules_validator/1;
+listen_opt_type(shaper_rule) -> fun acl:shaper_rules_validator/1;
+listen_opt_type(certfile) ->
+    fun(S) ->
+	    ejabberd_pkix:add_certfile(S),
+	    iolist_to_binary(S)
+    end;
+listen_opt_type(ciphers) -> fun iolist_to_binary/1;
+listen_opt_type(dhfile) -> fun misc:try_read_file/1;
+listen_opt_type(cafile) -> fun misc:try_read_file/1;
+listen_opt_type(protocol_options) ->
+    fun(Options) -> str:join(Options, <<"|">>) end;
+listen_opt_type(tls_compression) -> fun(B) when is_boolean(B) -> B end;
+listen_opt_type(tls) -> fun(B) when is_boolean(B) -> B end;
+listen_opt_type(check_from) -> fun(B) when is_boolean(B) -> B end;
+listen_opt_type(password) -> fun iolist_to_binary/1;
+listen_opt_type(hosts) ->
+    fun(HostOpts) ->
+	    lists:map(
+	      fun({Host, Opts}) ->
+		      Password = case proplists:get_value(password, Opts) of
+				     undefined -> undefined;
+				     P -> iolist_to_binary(P)
+				 end,
+		      {iolist_to_binary(Host), Password}
+	      end, HostOpts)
+    end;
+listen_opt_type(global_routes) ->
+    fun(B) when is_boolean(B) -> B end;
+listen_opt_type(max_stanza_size) ->
+    fun(I) when is_integer(I) -> I;
+       (unlimited) -> infinity;
+       (infinity) -> infinity
+    end;
+listen_opt_type(max_fsm_queue) ->
+    fun(I) when is_integer(I), I>0 -> I end;
+listen_opt_type(inet) -> fun(B) when is_boolean(B) -> B end;
+listen_opt_type(inet6) -> fun(B) when is_boolean(B) -> B end;
+listen_opt_type(backlog) ->
+    fun(I) when is_integer(I), I>0 -> I end;
+listen_opt_type(accept_interval) ->
+    fun(I) when is_integer(I), I>=0 -> I end;
+listen_opt_type(_) ->
+    [access, shaper_rule, certfile, ciphers, dhfile, cafile, tls,
+     protocol_options, tls_compression, password, hosts, check_from,
+     max_fsm_queue, global_routes, backlog, inet, inet6, accept_interval].

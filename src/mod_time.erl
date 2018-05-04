@@ -6,7 +6,7 @@
 %%% Created : 18 Jan 2003 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2015   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -32,59 +32,40 @@
 
 -behaviour(gen_mod).
 
--export([start/2, stop/1, process_local_iq/3,
-	 mod_opt_type/1]).
+-export([start/2, stop/1, reload/3, process_local_iq/1,
+	 mod_options/1, depends/2]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("jlib.hrl").
+-include("xmpp.hrl").
 
-start(Host, Opts) ->
-    IQDisc = gen_mod:get_opt(iqdisc, Opts, fun gen_iq_handler:check_type/1,
-                             one_queue),
+start(Host, _Opts) ->
     gen_iq_handler:add_iq_handler(ejabberd_local, Host,
-				  ?NS_TIME, ?MODULE, process_local_iq, IQDisc).
+				  ?NS_TIME, ?MODULE, process_local_iq).
 
 stop(Host) ->
     gen_iq_handler:remove_iq_handler(ejabberd_local, Host,
 				     ?NS_TIME).
 
-process_local_iq(_From, _To,
-		 #iq{type = Type, sub_el = SubEl} = IQ) ->
-    case Type of
-      set ->
-	  IQ#iq{type = error, sub_el = [SubEl, ?ERR_NOT_ALLOWED]};
-      get ->
-	  Now = now(),
-	  Now_universal = calendar:now_to_universal_time(Now),
-	  Now_local = calendar:now_to_local_time(Now),
-	  {UTC, UTC_diff} = jlib:timestamp_to_iso(Now_universal,
-						  utc),
-	  Seconds_diff =
-	      calendar:datetime_to_gregorian_seconds(Now_local) -
-		calendar:datetime_to_gregorian_seconds(Now_universal),
-	  {Hd, Md, _} =
-	      calendar:seconds_to_time(abs(Seconds_diff)),
-	  {_, TZO_diff} = jlib:timestamp_to_iso({{0, 1, 1},
-						 {0, 0, 0}},
-						{sign(Seconds_diff), {Hd, Md}}),
-	  IQ#iq{type = result,
-		sub_el =
-		    [#xmlel{name = <<"time">>,
-			    attrs = [{<<"xmlns">>, ?NS_TIME}],
-			    children =
-				[#xmlel{name = <<"tzo">>, attrs = [],
-					children = [{xmlcdata, TZO_diff}]},
-				 #xmlel{name = <<"utc">>, attrs = [],
-					children =
-					    [{xmlcdata,
-                                              <<UTC/binary,
-                                                UTC_diff/binary>>}]}]}]}
-    end.
+reload(_Host, _NewOpts, _OldOpts) ->
+    ok.
 
-sign(N) when N < 0 -> <<"-">>;
-sign(_) -> <<"+">>.
+process_local_iq(#iq{type = set, lang = Lang} = IQ) ->
+    Txt = <<"Value 'set' of 'type' attribute is not allowed">>,
+    xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
+process_local_iq(#iq{type = get} = IQ) ->
+    Now = p1_time_compat:timestamp(),
+    Now_universal = calendar:now_to_universal_time(Now),
+    Now_local = calendar:universal_time_to_local_time(Now_universal),
+    Seconds_diff =
+	calendar:datetime_to_gregorian_seconds(Now_local) -
+	calendar:datetime_to_gregorian_seconds(Now_universal),
+    {Hd, Md, _} = calendar:seconds_to_time(abs(Seconds_diff)),
+    xmpp:make_iq_result(IQ, #time{tzo = {Hd, Md}, utc = Now}).
 
-mod_opt_type(iqdisc) -> fun gen_iq_handler:check_type/1;
-mod_opt_type(_) -> [iqdisc].
+depends(_Host, _Opts) ->
+    [].
+
+mod_options(_Host) ->
+    [].

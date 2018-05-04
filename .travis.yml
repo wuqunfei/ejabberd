@@ -1,11 +1,12 @@
 language: erlang
 
 otp_release:
-  - 17.4
-  - R16B03
+  - 17.5
+  - 18.3
+  - 19.2
 
 services:
-  - riak
+  - redis-server
 
 before_install:
   #
@@ -16,15 +17,19 @@ before_install:
   # See: https://github.com/travis-ci/travis-ci/issues/1986
   #
   - sudo sed -i -e s/table_cache/table_open_cache/ -e /log_slow_queries/d /etc/mysql/my.cnf
-  - sudo apt-key adv --keyserver pgp.mit.edu --recv-keys 5072E1F5
+  - sudo apt-key adv --import .travis/mysql_repo_key.asc
   - sudo add-apt-repository 'deb http://repo.mysql.com/apt/ubuntu/ precise mysql-5.6'
   - sudo apt-get -qq update
-  - sudo apt-get -qq -o Dpkg::Options::=--force-confold install mysql-server-5.6
+  - sudo apt-get -qq -o Dpkg::Options::=--force-confold install mysql-server
+  - sudo mysql_upgrade
+  # /END MYSQL 5.6
+  - pip install --user coveralls-merge
 
 install:
-  - sudo apt-get -qq install libexpat1-dev libyaml-dev libpam0g-dev libsqlite3-dev
+  - sudo apt-get -qq install libexpat1-dev libyaml-dev libpam0g-dev libsqlite3-dev libgd-dev libwebp-dev
 
 before_script:
+  # Ulimit: See Travis-CI issue report: https://github.com/travis-ci/travis-ci/issues/3328
   - mysql -u root -e "CREATE USER 'ejabberd_test'@'localhost' IDENTIFIED BY 'ejabberd_test';"
   - mysql -u root -e "CREATE DATABASE ejabberd_test;"
   - mysql -u root -e "GRANT ALL ON ejabberd_test.* TO 'ejabberd_test'@'localhost';"
@@ -34,16 +39,27 @@ before_script:
 
 script:
   - ./autogen.sh
-  - ./configure --enable-all --disable-odbc --disable-elixir
+  - ./configure --prefix=/tmp/ejabberd --enable-all --disable-odbc --disable-riak
+  - make
+  - make install -s
   - make xref
-  - ERL_LIBS=$PWD make test
-  - grep -q 'TEST COMPLETE, \([[:digit:]]*\) ok, .* of \1 ' logs/raw.log
+  - sed -i -e 's/ct:pal/ct:log/' test/suite.erl
+  - ln -sf ../sql priv/
+  - echo "" >> rebar.config
+  - echo '{ct_extra_params, "-verbosity 20"}.' >> rebar.config
+  - escript ./rebar skip_deps=true ct -v
+  - grep -q 'TEST COMPLETE,.* 0 failed' logs/raw.log
 
 after_script:
   - find logs -name suite.log -exec cat '{}' ';'
 
 after_failure:
+  - find logs -name exunit.log -exec cat '{}' ';'
   - find logs -name ejabberd.log -exec cat '{}' ';'
+  - find logs -name suite.log -exec cat '{}' ';' | awk 'BEGIN{RS="\n=case";FS="\n"} /=result\s*failed/ {print "=case" $0}
+
+after_success:
+  - coveralls-merge erlang.json
 
 notifications:
   email: false

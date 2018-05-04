@@ -5,7 +5,7 @@
 %%% Created : 21 Aug 2007 by Badlop <badlop@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2015   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -17,10 +17,9 @@
 %%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
 %%% General Public License for more details.
 %%%
-%%% You should have received a copy of the GNU General Public License
-%%% along with this program; if not, write to the Free Software
-%%% Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
-%%% 02111-1307 USA
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 %%%
 %%%----------------------------------------------------------------------
 
@@ -36,19 +35,20 @@
 -author('badlop@process-one.net').
 
 -export([start/2, handler/2, process/2, socket_type/0,
-	 transform_listen_option/2]).
+	 transform_listen_option/2, listen_opt_type/1]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 -include("ejabberd_http.hrl").
 -include("mod_roster.hrl").
 
--include("jlib.hrl").
+-include("xmpp.hrl").
 
 -record(state,
 	{access_commands = [] :: list(),
-         auth = noauth        :: noauth | {binary(), binary(), binary()},
-         get_auth = true      :: boolean()}).
+         auth = noauth        :: noauth | map(),
+         get_auth = true      :: boolean(),
+	 ip                   :: inet:ip_address()}).
 
 %% Test:
 
@@ -196,44 +196,17 @@ socket_type() -> raw.
 %% -----------------------------
 %% HTTP interface
 %% -----------------------------
-process(_, #request{method = 'POST', data = Data, opts = Opts}) ->
-    AccessCommandsOpts = gen_mod:get_opt(access_commands, Opts,
-                                         fun(L) when is_list(L) -> L end,
-                                         []),
-    AccessCommands = lists:flatmap(
-                       fun({Ac, AcOpts}) ->
-                               Commands = gen_mod:get_opt(
-                                            commands, AcOpts,
-                                            fun(A) when is_atom(A) ->
-                                                    A;
-                                               (L) when is_list(L) ->
-                                                    true = lists:all(
-                                                             fun is_atom/1,
-                                                             L),
-                                                    L
-                                            end, all),
-                               CommOpts = gen_mod:get_opt(
-                                            options, AcOpts,
-                                            fun(L) when is_list(L) -> L end,
-                                            []),
-                               [{Ac, Commands, CommOpts}];
-                          (Wrong) ->
-                               ?WARNING_MSG("wrong options format for ~p: ~p",
-                                            [?MODULE, Wrong]),
-                               []
-                       end, AccessCommandsOpts),
-    GetAuth = case [ACom || {Ac, _, _} = ACom <- AccessCommands, Ac /= all] of
-		  [] -> false;
-		  _ -> true
-	      end,
-    State = #state{access_commands = AccessCommands, get_auth = GetAuth},
-    case xml_stream:parse_element(Data) of
+process(_, #request{method = 'POST', data = Data, opts = Opts, ip = {IP, _}}) ->
+    AccessCommands = proplists:get_value(access_commands, Opts),
+    GetAuth = true,
+    State = #state{access_commands = AccessCommands, get_auth = GetAuth, ip = IP},
+    case fxml_stream:parse_element(Data) of
 	{error, _} ->
 	    {400, [],
 	     #xmlel{name = <<"h1">>, attrs = [],
 		    children = [{xmlcdata, <<"Malformed XML">>}]}};
 	El ->
-	    case p1_xmlrpc:decode(El) of
+	    case fxmlrpc:decode(El) of
 		{error, _} = Err ->
 		    ?ERROR_MSG("XML-RPC request ~s failed with reason: ~p",
 			       [Data, Err]),
@@ -243,7 +216,7 @@ process(_, #request{method = 'POST', data = Data, opts = Opts}) ->
 		{ok, RPC} ->
 		    ?DEBUG("got XML-RPC request: ~p", [RPC]),
 		    {false, Result} = handler(State, RPC),
-		    XML = xml:element_to_binary(p1_xmlrpc:encode(Result)),
+		    XML = fxml:element_to_binary(fxmlrpc:encode(Result)),
 		    {200, [{<<"Content-Type">>, <<"text/xml">>}],
 		     <<"<?xml version=\"1.0\"?>", XML/binary>>}
 	    end
@@ -257,18 +230,37 @@ process(_, _) ->
 %% Access verification
 %% -----------------------------
 
-get_auth(AuthList) ->
-    [User, Server, Password] = try get_attrs([user, server,
-					      password],
-					     AuthList)
-			       of
-				 [U, S, P] -> [U, S, P]
-			       catch
-				 exit:{attribute_not_found, Attr, _} ->
-				     throw({error, missing_auth_arguments,
-					    Attr})
-			       end,
-    {User, Server, Password}.
+extract_auth(AuthList) ->
+    ?DEBUG("AUTHLIST ~p", [AuthList]),
+    try get_attrs([user, server, token], AuthList) of
+        [U0, S0, T] ->
+	    U = jid:nodeprep(U0),
+	    S = jid:nameprep(S0),
+	    case ejabberd_oauth:check_token(T) of
+		{ok, {U, S}, Scope} ->
+		    #{usr => {U, S, <<"">>}, oauth_scope => Scope, caller_server => S};
+		{false, Reason} ->
+		    {error, Reason};
+		_ ->
+		    {error, not_found}
+	    end
+    catch
+	exit:{attribute_not_found, _, _} ->
+            try get_attrs([user, server, password], AuthList) of
+                [U0, S0, P] ->
+		    U = jid:nodeprep(U0),
+		    S = jid:nameprep(S0),
+		    case ejabberd_auth:check_password(U, <<"">>, S, P) of
+			true ->
+			    #{usr => {U, S, <<"">>}, caller_server => S};
+			false ->
+			    {error, invalid_auth}
+		    end
+            catch
+		exit:{attribute_not_found, Attr, _} ->
+		    throw({error, missing_auth_arguments, Attr})
+            end
+    end.
 
 %% -----------------------------
 %% Handlers
@@ -294,16 +286,33 @@ get_auth(AuthList) ->
 %% xmlrpc:call({127, 0, 0, 1}, 4560, "/", {call, echothis, [{struct, [{user, "badlop"}, {server, "localhost"}, {password, "79C1574A43BC995F2B145A299EF97277"}]}, 152]}).
 %% {ok,{response,[152]}}
 
-handler(#state{get_auth = true, auth = noauth} = State,
+handler(#state{get_auth = true, auth = noauth, ip = IP} = State,
 	{call, Method,
 	 [{struct, AuthList} | Arguments] = AllArgs}) ->
-    try get_auth(AuthList) of
-      Auth ->
-	  handler(State#state{get_auth = false, auth = Auth},
-		  {call, Method, Arguments})
+    try extract_auth(AuthList) of
+	{error, invalid_auth} ->
+	    build_fault_response(-118,
+				 "Invalid authentication data",
+				 []);
+	{error, not_found} ->
+	    build_fault_response(-118,
+				 "Invalid oauth token",
+				 []);
+	{error, expired} ->
+	    build_fault_response(-118,
+				 "Invalid oauth token",
+				 []);
+	{error, Value} ->
+	    build_fault_response(-118,
+				 "Invalid authentication data: ~p",
+				 [Value]);
+        Auth ->
+            handler(State#state{get_auth = false, auth = Auth#{ip => IP, caller_module => ?MODULE}},
+                    {call, Method, Arguments})
     catch
       {error, missing_auth_arguments, _Attr} ->
-	  handler(State#state{get_auth = false, auth = noauth},
+	  handler(State#state{get_auth = false,
+			      auth = #{ip => IP, caller_module => ?MODULE}},
 		  {call, Method, AllArgs})
     end;
 %% .............................
@@ -329,7 +338,7 @@ handler(State, {call, Command, []}) ->
     handler(State, {call, Command, [{struct, []}]});
 handler(State,
 	{call, Command, [{struct, AttrL}]} = Payload) ->
-    case ejabberd_commands:get_command_format(Command) of
+    case ejabberd_commands:get_command_format(Command, State#state.auth) of
       {error, command_unknown} ->
 	  build_fault_response(-112, "Unknown call: ~p",
 			       [Payload]);
@@ -367,6 +376,10 @@ try_do_command(AccessCommands, Auth, Command, AttrL,
 			       "The call provided additional unused "
 				 "arguments:~n~p",
 			       [ExitAtL]);
+      exit:{invalid_arg_type, Arg, Type} ->
+	  build_fault_response(-122,
+			       "Parameter '~p' can't be coerced to type '~p'",
+			       [Arg, Type]);
       Why ->
 	  build_fault_response(-118,
 			       "A problem '~p' occurred executing the "
@@ -383,9 +396,14 @@ build_fault_response(Code, ParseString, ParseArgs) ->
 do_command(AccessCommands, Auth, Command, AttrL, ArgsF,
 	   ResultF) ->
     ArgsFormatted = format_args(AttrL, ArgsF),
+    Auth2 = case AccessCommands of
+		V when is_list(V) ->
+		    Auth#{extra_permissions => AccessCommands};
+		_ ->
+		    Auth
+	    end,
     Result =
-	ejabberd_commands:execute_command(AccessCommands, Auth,
-					  Command, ArgsFormatted),
+	ejabberd_commands:execute_command2(Command, ArgsFormatted, Auth2),
     ResultFormatted = format_result(Result, ResultF),
     {command_result, ResultFormatted}.
 
@@ -466,7 +484,7 @@ format_arg(undefined, binary) -> <<>>;
 format_arg(undefined, string) -> "";
 format_arg(Arg, Format) ->
     ?ERROR_MSG("don't know how to format Arg ~p for format ~p", [Arg, Format]),
-    error.
+    exit({invalid_arg_type, Arg, Format}).
 
 process_unicode_codepoints(Str) ->
     iolist_to_binary(lists:map(fun(X) when X > 255 -> unicode:characters_to_binary([X]);
@@ -479,13 +497,15 @@ process_unicode_codepoints(Str) ->
 
 format_result({error, Error}, _) ->
     throw({error, Error});
+format_result({error, _Type, _Code, Error}, _) ->
+    throw({error, Error});
 format_result(String, string) -> lists:flatten(String);
 format_result(Atom, {Name, atom}) ->
     {struct,
      [{Name, iolist_to_binary(atom_to_list(Atom))}]};
 format_result(Int, {Name, integer}) ->
     {struct, [{Name, Int}]};
-format_result(String, {Name, string}) when is_list(String) ->
+format_result([A|_]=String, {Name, string}) when is_list(String) and is_integer(A) ->
     {struct, [{Name, lists:flatten(String)}]};
 format_result(Binary, {Name, string}) when is_binary(Binary) ->
     {struct, [{Name, binary_to_list(Binary)}]};
@@ -541,3 +561,32 @@ transform_listen_option({access_commands, ACOpts}, Opts) ->
     [{access_commands, NewACOpts}|Opts];
 transform_listen_option(Opt, Opts) ->
     [Opt|Opts].
+
+listen_opt_type(access_commands) ->
+    fun(Opts) ->
+	    lists:map(
+	      fun({Ac, AcOpts}) ->
+		      Commands = case proplists:get_value(
+					commands, lists:flatten(AcOpts), all) of
+				     Cmd when is_atom(Cmd) -> Cmd;
+				     Cmds when is_list(Cmds) ->
+					 true = lists:all(fun is_atom/1, Cmds),
+					 Cmds
+				 end,
+		      {<<"ejabberd_xmlrpc compatibility shim">>,
+		       {[?MODULE], [{access, Ac}], Commands}}
+	      end, lists:flatten(Opts))
+    end;
+listen_opt_type(maxsessions) ->
+    fun(I) when is_integer(I), I>0 -> I end;
+listen_opt_type(timeout) ->
+    fun(I) when is_integer(I), I>0 -> I end;
+listen_opt_type(inet) -> fun(B) when is_boolean(B) -> B end;
+listen_opt_type(inet6) -> fun(B) when is_boolean(B) -> B end;
+listen_opt_type(backlog) ->
+    fun(I) when is_integer(I), I>0 -> I end;
+listen_opt_type(accept_interval) ->
+    fun(I) when is_integer(I), I>=0 -> I end;
+listen_opt_type(_) ->
+    [access_commands, maxsessions, timeout, backlog, inet, inet6,
+     accept_interval].

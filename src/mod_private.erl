@@ -5,7 +5,7 @@
 %%% Created : 16 Jan 2003 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2015   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -31,40 +31,37 @@
 
 -behaviour(gen_mod).
 
--export([start/2, stop/1, process_sm_iq/3, import/3,
-	 remove_user/2, get_data/2, export/1, import/1,
-	 mod_opt_type/1]).
+-export([start/2, stop/1, reload/3, process_sm_iq/1, import_info/0,
+	 remove_user/2, get_data/2, get_data/3, export/1,
+	 import/5, import_start/2, mod_opt_type/1, set_data/3,
+	 mod_options/1, depends/2]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
+-include("xmpp.hrl").
+-include("mod_private.hrl").
 
--include("jlib.hrl").
+-define(PRIVATE_CACHE, private_cache).
 
--record(private_storage,
-        {usns = {<<"">>, <<"">>, <<"">>} :: {binary(), binary(), binary() |
-                                             '$1' | '_'},
-         xml = #xmlel{} :: xmlel() | '_' | '$1'}).
+-callback init(binary(), gen_mod:opts()) -> any().
+-callback import(binary(), binary(), [binary()]) -> ok.
+-callback set_data(binary(), binary(), [{binary(), xmlel()}]) -> ok | {error, any()}.
+-callback get_data(binary(), binary(), binary()) -> {ok, xmlel()} | error | {error, any()}.
+-callback get_all_data(binary(), binary()) -> {ok, [xmlel()]} | error | {error, any()}.
+-callback del_data(binary(), binary()) -> ok | {error, any()}.
+-callback use_cache(binary()) -> boolean().
+-callback cache_nodes(binary()) -> [node()].
 
--define(Xmlel_Query(Attrs, Children),
-	#xmlel{name = <<"query">>, attrs = Attrs,
-	       children = Children}).
+-optional_callbacks([use_cache/1, cache_nodes/1]).
 
 start(Host, Opts) ->
-    IQDisc = gen_mod:get_opt(iqdisc, Opts, fun gen_iq_handler:check_type/1,
-                             one_queue),
-    case gen_mod:db_type(Host, Opts) of
-      mnesia ->
-	  mnesia:create_table(private_storage,
-			      [{disc_only_copies, [node()]},
-			       {attributes,
-				record_info(fields, private_storage)}]),
-	  update_table();
-      _ -> ok
-    end,
+    Mod = gen_mod:db_mod(Host, Opts, ?MODULE),
+    Mod:init(Host, Opts),
+    init_cache(Mod, Host, Opts),
     ejabberd_hooks:add(remove_user, Host, ?MODULE,
 		       remove_user, 50),
     gen_iq_handler:add_iq_handler(ejabberd_sm, Host,
-				  ?NS_PRIVATE, ?MODULE, process_sm_iq, IQDisc).
+				  ?NS_PRIVATE, ?MODULE, process_sm_iq).
 
 stop(Host) ->
     ejabberd_hooks:delete(remove_user, Host, ?MODULE,
@@ -72,257 +69,197 @@ stop(Host) ->
     gen_iq_handler:remove_iq_handler(ejabberd_sm, Host,
 				     ?NS_PRIVATE).
 
-process_sm_iq(#jid{luser = LUser, lserver = LServer},
-	      #jid{luser = LUser, lserver = LServer}, IQ)
-    when IQ#iq.type == set ->
-    case IQ#iq.sub_el of
-      #xmlel{name = <<"query">>, children = Xmlels} ->
-	  case filter_xmlels(Xmlels) of
-	    [] ->
-		IQ#iq{type = error,
-		      sub_el = [IQ#iq.sub_el, ?ERR_NOT_ACCEPTABLE]};
-	    Data ->
-		DBType = gen_mod:db_type(LServer, ?MODULE),
-		F = fun () ->
-			    lists:foreach(fun (Datum) ->
-						  set_data(LUser, LServer,
-							   Datum, DBType)
-					  end,
-					  Data)
-		    end,
-		case DBType of
-		  odbc -> ejabberd_odbc:sql_transaction(LServer, F);
-		  mnesia -> mnesia:transaction(F);
-		  riak -> F()
-		end,
-		IQ#iq{type = result, sub_el = []}
-	  end;
-      _ ->
-	  IQ#iq{type = error,
-		sub_el = [IQ#iq.sub_el, ?ERR_NOT_ACCEPTABLE]}
+reload(Host, NewOpts, OldOpts) ->
+    NewMod = gen_mod:db_mod(Host, NewOpts, ?MODULE),
+    OldMod = gen_mod:db_mod(Host, OldOpts, ?MODULE),
+    if NewMod /= OldMod ->
+	    NewMod:init(Host, NewOpts);
+       true ->
+	    ok
+    end,
+    init_cache(NewMod, Host, NewOpts).
+
+-spec process_sm_iq(iq()) -> iq().
+process_sm_iq(#iq{type = Type, lang = Lang,
+		  from = #jid{luser = LUser, lserver = LServer},
+		  to = #jid{luser = LUser, lserver = LServer},
+		  sub_els = [#private{sub_els = Els0}]} = IQ) ->
+    case filter_xmlels(Els0) of
+	[] ->
+	    Txt = <<"No private data found in this query">>,
+	    xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang));
+	Data when Type == set ->
+	    case set_data(LUser, LServer, Data) of
+		ok ->
+		    xmpp:make_iq_result(IQ);
+		{error, _} ->
+		    Txt = <<"Database failure">>,
+		    Err = xmpp:err_internal_server_error(Txt, Lang),
+		    xmpp:make_error(IQ, Err)
+	    end;
+	Data when Type == get ->
+	    case get_data(LUser, LServer, Data) of
+		{error, _} ->
+		    Txt = <<"Database failure">>,
+		    Err = xmpp:err_internal_server_error(Txt, Lang),
+		    xmpp:make_error(IQ, Err);
+		Els ->
+		    xmpp:make_iq_result(IQ, #private{sub_els = Els})
+	    end
     end;
-%%
-process_sm_iq(#jid{luser = LUser, lserver = LServer},
-	      #jid{luser = LUser, lserver = LServer}, IQ)
-    when IQ#iq.type == get ->
-    case IQ#iq.sub_el of
-      #xmlel{name = <<"query">>, attrs = Attrs,
-	     children = Xmlels} ->
-	  case filter_xmlels(Xmlels) of
-	    [] ->
-		IQ#iq{type = error,
-		      sub_el = [IQ#iq.sub_el, ?ERR_BAD_FORMAT]};
-	    Data ->
-		case catch get_data(LUser, LServer, Data) of
-		  {'EXIT', _Reason} ->
-		      IQ#iq{type = error,
-			    sub_el =
-				[IQ#iq.sub_el, ?ERR_INTERNAL_SERVER_ERROR]};
-		  Storage_Xmlels ->
-		      IQ#iq{type = result,
-			    sub_el = [?Xmlel_Query(Attrs, Storage_Xmlels)]}
-		end
-	  end;
-      _ ->
-	  IQ#iq{type = error,
-		sub_el = [IQ#iq.sub_el, ?ERR_BAD_FORMAT]}
-    end;
-%%
-process_sm_iq(_From, _To, IQ) ->
-    IQ#iq{type = error,
-	  sub_el = [IQ#iq.sub_el, ?ERR_FORBIDDEN]}.
+process_sm_iq(#iq{lang = Lang} = IQ) ->
+    Txt = <<"Query to another users is forbidden">>,
+    xmpp:make_error(IQ, xmpp:err_forbidden(Txt, Lang)).
 
-filter_xmlels(Xmlels) -> filter_xmlels(Xmlels, []).
+-spec filter_xmlels([xmlel()]) -> [{binary(), xmlel()}].
+filter_xmlels(Els) ->
+    lists:flatmap(
+      fun(#xmlel{} = El) ->
+	      case fxml:get_tag_attr_s(<<"xmlns">>, El) of
+		  <<"">> -> [];
+		  NS -> [{NS, El}]
+	      end
+      end, Els).
 
-filter_xmlels([], Data) -> lists:reverse(Data);
-filter_xmlels([#xmlel{attrs = Attrs} = Xmlel | Xmlels],
-	      Data) ->
-    case xml:get_attr_s(<<"xmlns">>, Attrs) of
-      <<"">> -> [];
-      XmlNS -> filter_xmlels(Xmlels, [{XmlNS, Xmlel} | Data])
-    end;
-filter_xmlels([_ | Xmlels], Data) ->
-    filter_xmlels(Xmlels, Data).
+-spec set_data(binary(), binary(), [{binary(), xmlel()}]) -> ok | {error, _}.
+set_data(LUser, LServer, Data) ->
+    Mod = gen_mod:db_mod(LServer, ?MODULE),
+    case Mod:set_data(LUser, LServer, Data) of
+	ok ->
+	    delete_cache(Mod, LUser, LServer, Data);
+	{error, _} = Err ->
+	    Err
+    end.
 
-set_data(LUser, LServer, {XmlNS, Xmlel}, mnesia) ->
-    mnesia:write(#private_storage{usns =
-				      {LUser, LServer, XmlNS},
-				  xml = Xmlel});
-set_data(LUser, LServer, {XMLNS, El}, odbc) ->
-    Username = ejabberd_odbc:escape(LUser),
-    LXMLNS = ejabberd_odbc:escape(XMLNS),
-    SData = ejabberd_odbc:escape(xml:element_to_binary(El)),
-    odbc_queries:set_private_data(LServer, Username, LXMLNS,
-				  SData);
-set_data(LUser, LServer, {XMLNS, El}, riak) ->
-    ejabberd_riak:put(#private_storage{usns = {LUser, LServer, XMLNS},
-                                       xml = El},
-		      private_storage_schema(),
-                      [{'2i', [{<<"us">>, {LUser, LServer}}]}]).
-
+-spec get_data(binary(), binary(), [{binary(), xmlel()}]) -> [xmlel()] | {error, _}.
 get_data(LUser, LServer, Data) ->
-    get_data(LUser, LServer,
-	     gen_mod:db_type(LServer, ?MODULE), Data, []).
+    Mod = gen_mod:db_mod(LServer, ?MODULE),
+    lists:foldr(
+      fun(_, {error, _} = Err) ->
+	      Err;
+	 ({NS, El}, Els) ->
+	      Res = case use_cache(Mod, LServer) of
+			true ->
+			    ets_cache:lookup(
+			      ?PRIVATE_CACHE, {LUser, LServer, NS},
+			      fun() -> Mod:get_data(LUser, LServer, NS) end);
+			false ->
+			    Mod:get_data(LUser, LServer, NS)
+		    end,
+	      case Res of
+		  {ok, StorageEl} ->
+		      [StorageEl|Els];
+		  error ->
+		      [El|Els];
+		  {error, _} = Err ->
+		      Err
+	      end
+      end, [], Data).
 
-get_data(_LUser, _LServer, _DBType, [],
-	 Storage_Xmlels) ->
-    lists:reverse(Storage_Xmlels);
-get_data(LUser, LServer, mnesia,
-	 [{XmlNS, Xmlel} | Data], Storage_Xmlels) ->
-    case mnesia:dirty_read(private_storage,
-			   {LUser, LServer, XmlNS})
-	of
-      [#private_storage{xml = Storage_Xmlel}] ->
-	  get_data(LUser, LServer, mnesia, Data,
-		   [Storage_Xmlel | Storage_Xmlels]);
-      _ ->
-	  get_data(LUser, LServer, mnesia, Data,
-		   [Xmlel | Storage_Xmlels])
-    end;
-get_data(LUser, LServer, odbc, [{XMLNS, El} | Els],
-	 Res) ->
-    Username = ejabberd_odbc:escape(LUser),
-    LXMLNS = ejabberd_odbc:escape(XMLNS),
-    case catch odbc_queries:get_private_data(LServer,
-					     Username, LXMLNS)
-	of
-      {selected, [<<"data">>], [[SData]]} ->
-	  case xml_stream:parse_element(SData) of
-	    Data when is_record(Data, xmlel) ->
-		get_data(LUser, LServer, odbc, Els, [Data | Res])
-	  end;
-      _ -> get_data(LUser, LServer, odbc, Els, [El | Res])
-    end;
-get_data(LUser, LServer, riak, [{XMLNS, El} | Els],
-	 Res) ->
-    case ejabberd_riak:get(private_storage, private_storage_schema(),
-			   {LUser, LServer, XMLNS}) of
-        {ok, #private_storage{xml = NewEl}} ->
-            get_data(LUser, LServer, riak, Els, [NewEl|Res]);
-        _ ->
-            get_data(LUser, LServer, riak, Els, [El|Res])
-    end.
-
+-spec get_data(binary(), binary()) -> [xmlel()] | {error, _}.
 get_data(LUser, LServer) ->
-    get_all_data(LUser, LServer,
-                 gen_mod:db_type(LServer, ?MODULE)).
-
-get_all_data(LUser, LServer, mnesia) ->
-    lists:flatten(
-      mnesia:dirty_select(private_storage,
-                          [{#private_storage{usns = {LUser, LServer, '_'},
-                                             xml = '$1'},
-                            [], ['$1']}]));
-get_all_data(LUser, LServer, odbc) ->
-    Username = ejabberd_odbc:escape(LUser),
-    case catch odbc_queries:get_private_data(LServer, Username) of
-        {selected, [<<"namespace">>, <<"data">>], Res} ->
-            lists:flatmap(
-              fun([_, SData]) ->
-                      case xml_stream:parse_element(SData) of
-                          #xmlel{} = El ->
-                              [El];
-                          _ ->
-                              []
-                      end
-              end, Res);
-        _ ->
-            []
-    end;
-get_all_data(LUser, LServer, riak) ->
-    case ejabberd_riak:get_by_index(
-           private_storage, private_storage_schema(),
-	   <<"us">>, {LUser, LServer}) of
-        {ok, Res} ->
-            [El || #private_storage{xml = El} <- Res];
-        _ ->
-            []
+    Mod = gen_mod:db_mod(LServer, ?MODULE),
+    case Mod:get_all_data(LUser, LServer) of
+	{ok, Els} -> Els;
+	error -> [];
+	{error, _} = Err -> Err
     end.
 
-private_storage_schema() ->
-    {record_info(fields, private_storage), #private_storage{}}.
-
+-spec remove_user(binary(), binary()) -> ok.
 remove_user(User, Server) ->
-    LUser = jlib:nodeprep(User),
-    LServer = jlib:nameprep(Server),
-    remove_user(LUser, LServer,
-		gen_mod:db_type(Server, ?MODULE)).
+    LUser = jid:nodeprep(User),
+    LServer = jid:nameprep(Server),
+    Mod = gen_mod:db_mod(Server, ?MODULE),
+    Data = case use_cache(Mod, LServer) of
+	       true ->
+		   case Mod:get_all_data(LUser, LServer) of
+		       {ok, Els} -> filter_xmlels(Els);
+		       _ -> []
+		   end;
+	       false ->
+		   []
+	   end,
+    Mod:del_data(LUser, LServer),
+    delete_cache(Mod, LUser, LServer, Data).
 
-remove_user(LUser, LServer, mnesia) ->
-    F = fun () ->
-		Namespaces = mnesia:select(private_storage,
-					   [{#private_storage{usns =
-								  {LUser,
-								   LServer,
-								   '$1'},
-							      _ = '_'},
-					     [], ['$$']}]),
-		lists:foreach(fun ([Namespace]) ->
-				      mnesia:delete({private_storage,
-						     {LUser, LServer,
-						      Namespace}})
-			      end,
-			      Namespaces)
-	end,
-    mnesia:transaction(F);
-remove_user(LUser, LServer, odbc) ->
-    Username = ejabberd_odbc:escape(LUser),
-    odbc_queries:del_user_private_storage(LServer,
-					  Username);
-remove_user(LUser, LServer, riak) ->
-    {atomic, ejabberd_riak:delete_by_index(private_storage,
-                                           <<"us">>, {LUser, LServer})}.
-
-update_table() ->
-    Fields = record_info(fields, private_storage),
-    case mnesia:table_info(private_storage, attributes) of
-      Fields ->
-          ejabberd_config:convert_table_to_binary(
-            private_storage, Fields, set,
-            fun(#private_storage{usns = {U, _, _}}) -> U end,
-            fun(#private_storage{usns = {U, S, NS}, xml = El} = R) ->
-                    R#private_storage{usns = {iolist_to_binary(U),
-                                              iolist_to_binary(S),
-                                              iolist_to_binary(NS)},
-                                      xml = xml:to_xmlel(El)}
-            end);
-      _ ->
-	  ?INFO_MSG("Recreating private_storage table", []),
-	  mnesia:transform_table(private_storage, ignore, Fields)
+-spec delete_cache(module(), binary(), binary(), [{binary(), xmlel()}]) -> ok.
+delete_cache(Mod, LUser, LServer, Data) ->
+    case use_cache(Mod, LServer) of
+	true ->
+	    Nodes = cache_nodes(Mod, LServer),
+	    lists:foreach(
+	      fun({NS, _}) ->
+		      ets_cache:delete(?PRIVATE_CACHE,
+				       {LUser, LServer, NS},
+				       Nodes)
+	      end, Data);
+	false ->
+	    ok
     end.
 
-export(_Server) ->
-    [{private_storage,
-      fun(Host, #private_storage{usns = {LUser, LServer, XMLNS},
-                                 xml = Data})
-            when LServer == Host ->
-              Username = ejabberd_odbc:escape(LUser),
-              LXMLNS = ejabberd_odbc:escape(XMLNS),
-              SData =
-                  ejabberd_odbc:escape(xml:element_to_binary(Data)),
-              odbc_queries:set_private_data_sql(Username, LXMLNS,
-                                                SData);
-         (_Host, _R) ->
-              []
-      end}].
+-spec init_cache(module(), binary(), gen_mod:opts()) -> ok.
+init_cache(Mod, Host, Opts) ->
+    case use_cache(Mod, Host) of
+	true ->
+	    CacheOpts = cache_opts(Opts),
+	    ets_cache:new(?PRIVATE_CACHE, CacheOpts);
+	false ->
+	    ets_cache:delete(?PRIVATE_CACHE)
+    end.
 
-import(LServer) ->
-    [{<<"select username, namespace, data from private_storage;">>,
-      fun([LUser, XMLNS, XML]) ->
-              El = #xmlel{} = xml_stream:parse_element(XML),
-              #private_storage{usns = {LUser, LServer, XMLNS},
-                               xml = El}
-      end}].
+-spec cache_opts(gen_mod:opts()) -> [proplists:property()].
+cache_opts(Opts) ->
+    MaxSize = gen_mod:get_opt(cache_size, Opts),
+    CacheMissed = gen_mod:get_opt(cache_missed, Opts),
+    LifeTime = case gen_mod:get_opt(cache_life_time, Opts) of
+		   infinity -> infinity;
+		   I -> timer:seconds(I)
+	       end,
+    [{max_size, MaxSize}, {cache_missed, CacheMissed}, {life_time, LifeTime}].
 
-import(_LServer, mnesia, #private_storage{} = PS) ->
-    mnesia:dirty_write(PS);
+-spec use_cache(module(), binary()) -> boolean().
+use_cache(Mod, Host) ->
+    case erlang:function_exported(Mod, use_cache, 1) of
+	true -> Mod:use_cache(Host);
+	false -> gen_mod:get_module_opt(Host, ?MODULE, use_cache)
+    end.
 
-import(_LServer, riak, #private_storage{usns = {LUser, LServer, _}} = PS) ->
-    ejabberd_riak:put(PS, private_storage_schema(),
-		      [{'2i', [{<<"us">>, {LUser, LServer}}]}]);
-import(_, _, _) ->
-    pass.
+-spec cache_nodes(module(), binary()) -> [node()].
+cache_nodes(Mod, Host) ->
+    case erlang:function_exported(Mod, cache_nodes, 1) of
+	true -> Mod:cache_nodes(Host);
+	false -> ejabberd_cluster:get_nodes()
+    end.
 
-mod_opt_type(db_type) -> fun gen_mod:v_db/1;
-mod_opt_type(iqdisc) -> fun gen_iq_handler:check_type/1;
-mod_opt_type(_) -> [db_type, iqdisc].
+import_info() ->
+    [{<<"private_storage">>, 4}].
+
+import_start(LServer, DBType) ->
+    Mod = gen_mod:db_mod(DBType, ?MODULE),
+    Mod:init(LServer, []).
+
+export(LServer) ->
+    Mod = gen_mod:db_mod(LServer, ?MODULE),
+    Mod:export(LServer).
+
+import(LServer, {sql, _}, DBType, Tab, L) ->
+    Mod = gen_mod:db_mod(DBType, ?MODULE),
+    Mod:import(LServer, Tab, L).
+
+depends(_Host, _Opts) ->
+    [].
+
+mod_opt_type(db_type) -> fun(T) -> ejabberd_config:v_db(?MODULE, T) end;
+mod_opt_type(O) when O == cache_life_time; O == cache_size ->
+    fun (I) when is_integer(I), I > 0 -> I;
+        (infinity) -> infinity
+    end;
+mod_opt_type(O) when O == use_cache; O == cache_missed ->
+    fun (B) when is_boolean(B) -> B end.
+
+mod_options(Host) ->
+    [{db_type, ejabberd_config:default_db(Host, ?MODULE)},
+     {use_cache, ejabberd_config:use_cache(Host)},
+     {cache_size, ejabberd_config:cache_size(Host)},
+     {cache_missed, ejabberd_config:cache_missed(Host)},
+     {cache_life_time, ejabberd_config:cache_life_time(Host)}].

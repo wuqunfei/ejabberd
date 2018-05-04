@@ -3,6 +3,24 @@
 %%% Author  : Badlop <badlop@process-one.net>
 %%% Purpose : Multicast router
 %%% Created : 11 Aug 2007 by Badlop <badlop@process-one.net>
+%%%
+%%%
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%%
+%%% This program is free software; you can redistribute it and/or
+%%% modify it under the terms of the GNU General Public License as
+%%% published by the Free Software Foundation; either version 2 of the
+%%% License, or (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+%%% General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+%%%
 %%%----------------------------------------------------------------------
 
 -module(ejabberd_router_multicast).
@@ -25,9 +43,10 @@
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
--include("jlib.hrl").
+-include("xmpp.hrl").
 
--record(route_multicast, {domain, pid}).
+-record(route_multicast, {domain = <<"">> :: binary() | '_',
+			  pid = self() :: pid()}).
 -record(state, {}).
 
 %%====================================================================
@@ -40,9 +59,9 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
-
+-spec route_multicast(jid(), binary(), [jid()], stanza()) -> ok.
 route_multicast(From, Domain, Destinations, Packet) ->
-    case catch do_route(From, Domain, Destinations, Packet) of
+    case catch do_route(Domain, Destinations, xmpp:set_from(Packet, From)) of
 	{'EXIT', Reason} ->
 	    ?ERROR_MSG("~p~nwhen processing: ~p",
 		       [Reason, {From, Domain, Destinations, Packet}]);
@@ -50,8 +69,9 @@ route_multicast(From, Domain, Destinations, Packet) ->
 	    ok
     end.
 
+-spec register_route(binary()) -> any().
 register_route(Domain) ->
-    case jlib:nameprep(Domain) of
+    case jid:nameprep(Domain) of
 	error ->
 	    erlang:error({invalid_domain, Domain});
 	LDomain ->
@@ -63,8 +83,9 @@ register_route(Domain) ->
 	    mnesia:transaction(F)
     end.
 
+-spec unregister_route(binary()) -> any().
 unregister_route(Domain) ->
-    case jlib:nameprep(Domain) of
+    case jid:nameprep(Domain) of
 	error ->
 	    erlang:error({invalid_domain, Domain});
 	LDomain ->
@@ -94,12 +115,11 @@ unregister_route(Domain) ->
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
 init([]) ->
-    mnesia:create_table(route_multicast,
+    ejabberd_mnesia:create(?MODULE, route_multicast,
 			[{ram_copies, [node()]},
 			 {type, bag},
 			 {attributes,
 			  record_info(fields, route_multicast)}]),
-    mnesia:add_table_copy(route_multicast, node(), ram_copies),
     mnesia:subscribe({table, route_multicast, simple}),
     lists:foreach(
       fun(Pid) ->
@@ -136,11 +156,11 @@ handle_cast(_Msg, State) ->
 %%                                       {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
-handle_info({route_multicast, From, Domain, Destinations, Packet}, State) ->
-    case catch do_route(From, Domain, Destinations, Packet) of
+handle_info({route_multicast, Domain, Destinations, Packet}, State) ->
+    case catch do_route(Domain, Destinations, Packet) of
 	{'EXIT', Reason} ->
 	    ?ERROR_MSG("~p~nwhen processing: ~p",
-		       [Reason, {From, Domain, Destinations, Packet}]);
+		       [Reason, {Domain, Destinations, Packet}]);
 	_ ->
 	    ok
     end,
@@ -188,26 +208,24 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %% From = #jid
 %% Destinations = [#jid]
-do_route(From, Domain, Destinations, Packet) ->
-
-    ?DEBUG("route_multicast~n\tfrom ~s~n\tdomain ~s~n\tdestinations ~p~n\tpacket ~p~n",
-	   [jlib:jid_to_string(From),
-	    Domain,
-	    [jlib:jid_to_string(To) || To <- Destinations],
-	    Packet]),
-
+-spec do_route(binary(), [jid()], stanza()) -> any().
+do_route(Domain, Destinations, Packet) ->
+    ?DEBUG("route multicast:~n~s~nDomain: ~s~nDestinations: ~s~n",
+	   [xmpp:pp(Packet), Domain,
+	    str:join([jid:encode(To) || To <- Destinations], <<", ">>)]),
     %% Try to find an appropriate multicast service
     case mnesia:dirty_read(route_multicast, Domain) of
 
 	%% If no multicast service is available in this server, send manually
-	[] -> do_route_normal(From, Destinations, Packet);
+	[] -> do_route_normal(Destinations, Packet);
 
 	%% If some is available, send the packet using multicast service
 	Rs when is_list(Rs) ->
 	    Pid = pick_multicast_pid(Rs),
-	    Pid ! {route_trusted, From, Destinations, Packet}
+	    Pid ! {route_trusted, Destinations, Packet}
     end.
 
+-spec pick_multicast_pid([#route_multicast{}]) -> pid().
 pick_multicast_pid(Rs) ->
     List = case [R || R <- Rs, node(R#route_multicast.pid) == node()] of
 	[] -> Rs;
@@ -215,5 +233,6 @@ pick_multicast_pid(Rs) ->
     end,
     (hd(List))#route_multicast.pid.
 
-do_route_normal(From, Destinations, Packet) ->
-    [ejabberd_router:route(From, To, Packet) || To <- Destinations].
+-spec do_route_normal([jid()], stanza()) -> any().
+do_route_normal(Destinations, Packet) ->
+    [ejabberd_router:route(xmpp:set_to(Packet, To)) || To <- Destinations].

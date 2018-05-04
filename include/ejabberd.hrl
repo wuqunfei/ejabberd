@@ -1,6 +1,6 @@
 %%%----------------------------------------------------------------------
 %%%
-%%% ejabberd, Copyright (C) 2002-2015   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -33,13 +33,13 @@
 
 -define(SQL_DIR, filename:join(["priv", "sql"])).
 
--define(CONFIG_PATH, <<"ejabberd.cfg">>).
+-define(CONFIG_PATH, <<"ejabberd.yml">>).
 
--define(LOG_PATH, <<"ejabberd.log">>).
+-define(LOG_PATH, "ejabberd.log").
 
 -define(EJABBERD_URI, <<"http://www.process-one.net/en/ejabberd/">>).
 
--define(S2STIMEOUT, 600000).
+-define(COPYRIGHT, "Copyright (c) ProcessOne").
 
 %%-define(DBGFSM, true).
 
@@ -64,7 +64,7 @@
 
 -define(TDICT, dict:dict()).
 -define(TGB_TREE, gb_trees:tree()).
--define(TGB_SET, gb_set:set()).
+-define(TGB_SET, gb_sets:set()).
 -define(TQUEUE, queue:queue()).
 
 -endif.

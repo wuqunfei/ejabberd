@@ -1,12 +1,11 @@
 %%%-------------------------------------------------------------------
-%%% @author Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%% @copyright (C) 2014, Evgeny Khramtsov
-%%% @doc
-%%%
-%%% @end
+%%% File    : mod_sip_registrar.erl
+%%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
+%%% Purpose : 
 %%% Created : 23 Apr 2014 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
-%%% ejabberd, Copyright (C) 2014-2015   ProcessOne
+%%%
+%%% ejabberd, Copyright (C) 2014-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -21,11 +20,17 @@
 %%% You should have received a copy of the GNU General Public License along
 %%% with this program; if not, write to the Free Software Foundation, Inc.,
 %%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-
+%%%
 %%%-------------------------------------------------------------------
+
 -module(mod_sip_registrar).
 
--define(GEN_SERVER, p1_server).
+-ifndef(SIP).
+-export([]).
+-else.
+-ifndef(GEN_SERVER).
+-define(GEN_SERVER, gen_server).
+-endif.
 -behaviour(?GEN_SERVER).
 
 %% API
@@ -41,16 +46,14 @@
 
 -define(CALL_TIMEOUT, timer:seconds(30)).
 -define(DEFAULT_EXPIRES, 3600).
--define(FLOW_TIMEOUT_UDP, 29).
--define(FLOW_TIMEOUT_TCP, 120).
 
 -record(sip_session, {us = {<<"">>, <<"">>} :: {binary(), binary()},
 		      socket = #sip_socket{} :: #sip_socket{},
 		      call_id = <<"">> :: binary(),
 		      cseq = 0 :: non_neg_integer(),
-		      timestamp = now() :: erlang:timestamp(),
+		      timestamp = p1_time_compat:timestamp() :: erlang:timestamp(),
 		      contact :: {binary(), #uri{}, [{binary(), binary()}]},
-		      flow_tref :: reference(),
+		      flow_tref :: reference() | undefined,
 		      reg_tref = make_ref() :: reference(),
 		      conn_mref = make_ref() :: reference(),
 		      expires = 0 :: non_neg_integer()}).
@@ -65,8 +68,8 @@ start_link() ->
 
 request(#sip{hdrs = Hdrs} = Req, SIPSock) ->
     {_, #uri{user = U, host = S}, _} = esip:get_hdr('to', Hdrs),
-    LUser = jlib:nodeprep(U),
-    LServer = jlib:nameprep(S),
+    LUser = jid:nodeprep(U),
+    LServer = jid:nameprep(S),
     {PeerIP, _} = SIPSock#sip_socket.peer,
     US = {LUser, LServer},
     CallID = esip:get_hdr('call-id', Hdrs),
@@ -178,14 +181,13 @@ ping(SIPSocket) ->
 %%% gen_server callbacks
 %%%===================================================================
 init([]) ->
+    process_flag(trap_exit, true),
     update_table(),
-    mnesia:create_table(sip_session,
+    ejabberd_mnesia:create(?MODULE, sip_session,
 			[{ram_copies, [node()]},
 			 {type, bag},
-			 {attributes, record_info(fields, sip_session)}]),
-    mnesia:add_table_index(sip_session, conn_mref),
-    mnesia:add_table_index(sip_session, socket),
-    mnesia:add_table_copy(sip_session, node(), ram_copies),
+			 {attributes, record_info(fields, sip_session)},
+			 {index, [conn_mref,socket]}]),
     {ok, #state{}}.
 
 handle_call({write, Sessions, Supported}, _From, State) ->
@@ -242,7 +244,7 @@ register_session(US, SIPSocket, CallID, CSeq, IsOutboundSupported,
 				      socket = SIPSocket,
 				      call_id = CallID,
 				      cseq = CSeq,
-				      timestamp = now(),
+				      timestamp = p1_time_compat:timestamp(),
 				      contact = Contact,
 				      expires = Expires}
 		 end, ContactsWithExpires),
@@ -355,7 +357,7 @@ min_expires() ->
     60.
 
 to_integer(Bin, Min, Max) ->
-    case catch list_to_integer(binary_to_list(Bin)) of
+    case catch (binary_to_integer(Bin)) of
         N when N >= Min, N =< Max ->
             {ok, N};
         _ ->
@@ -493,14 +495,10 @@ get_flow_timeout(LServer, #sip_socket{type = Type}) ->
     case Type of
 	udp ->
 	    gen_mod:get_module_opt(
-	      LServer, mod_sip, flow_timeout_udp,
-	      fun(I) when is_integer(I), I>0 -> I end,
-	      ?FLOW_TIMEOUT_UDP);
+	      LServer, mod_sip, flow_timeout_udp);
 	_ ->
 	    gen_mod:get_module_opt(
-	      LServer, mod_sip, flow_timeout_tcp,
-	      fun(I) when is_integer(I), I>0 -> I end,
-	      ?FLOW_TIMEOUT_TCP)
+	      LServer, mod_sip, flow_timeout_tcp)
     end.
 
 update_table() ->
@@ -582,3 +580,5 @@ process_ping(SIPSocket) ->
 	 (_, Acc) ->
 	      Acc
       end, ErrResponse, Sessions).
+
+-endif.

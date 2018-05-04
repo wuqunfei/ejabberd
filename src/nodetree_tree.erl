@@ -1,29 +1,27 @@
-%%% ====================================================================
-%%% ``The contents of this file are subject to the Erlang Public License,
-%%% Version 1.1, (the "License"); you may not use this file except in
-%%% compliance with the License. You should have received a copy of the
-%%% Erlang Public License along with this software. If not, it can be
-%%% retrieved via the world wide web at http://www.erlang.org/.
-%%% 
-%%%
-%%% Software distributed under the License is distributed on an "AS IS"
-%%% basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See
-%%% the License for the specific language governing rights and limitations
-%%% under the License.
-%%% 
-%%%
-%%% The Initial Developer of the Original Code is ProcessOne.
-%%% Portions created by ProcessOne are Copyright 2006-2015, ProcessOne
-%%% All Rights Reserved.''
-%%% This software is copyright 2006-2015, ProcessOne.
+%%%----------------------------------------------------------------------
+%%% File    : nodetree_tree.erl
+%%% Author  : Christophe Romain <christophe.romain@process-one.net>
+%%% Purpose : Standard node tree plugin
+%%% Created :  1 Dec 2007 by Christophe Romain <christophe.romain@process-one.net>
 %%%
 %%%
-%%% @copyright 2006-2015 ProcessOne
-%%% @author Christophe Romain <christophe.romain@process-one.net>
-%%%   [http://www.process-one.net/]
-%%% @version {@vsn}, {@date} {@time}
-%%% @end
-%%% ====================================================================
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%%
+%%% This program is free software; you can redistribute it and/or
+%%% modify it under the terms of the GNU General Public License as
+%%% published by the Free Software Foundation; either version 2 of the
+%%% License, or (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+%%% General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+%%%
+%%%----------------------------------------------------------------------
 
 %%% @doc The module <strong>{@module}</strong> is the default PubSub node tree plugin.
 %%% <p>It is used as a default for all unknown PubSub node type.  It can serve
@@ -42,7 +40,7 @@
 -include_lib("stdlib/include/qlc.hrl").
 
 -include("pubsub.hrl").
--include("jlib.hrl").
+-include("xmpp.hrl").
 
 -export([init/3, terminate/2, options/0, set_node/1,
     get_node/3, get_node/2, get_node/1, get_nodes/2,
@@ -51,15 +49,10 @@
     delete_node/2]).
 
 init(_Host, _ServerHost, _Options) ->
-    mnesia:create_table(pubsub_node,
+    ejabberd_mnesia:create(?MODULE, pubsub_node,
 	[{disc_copies, [node()]},
-	    {attributes, record_info(fields, pubsub_node)}]),
-    mnesia:add_table_index(pubsub_node, id),
-    NodesFields = record_info(fields, pubsub_node),
-    case mnesia:table_info(pubsub_node, attributes) of
-	NodesFields -> ok;
-	_ -> ok
-    end,
+	    {attributes, record_info(fields, pubsub_node)},
+	    {index, [id]}]),
     %% mnesia:transform_table(pubsub_state, ignore, StatesFields)
     ok.
 
@@ -76,15 +69,15 @@ get_node(Host, Node, _From) ->
     get_node(Host, Node).
 
 get_node(Host, Node) ->
-    case catch mnesia:read({pubsub_node, {Host, Node}}) of
+    case mnesia:read({pubsub_node, {Host, Node}}) of
 	[Record] when is_record(Record, pubsub_node) -> Record;
-	_ -> {error, ?ERR_ITEM_NOT_FOUND}
+	_ -> {error, xmpp:err_item_not_found(<<"Node not found">>, ?MYLANG)}
     end.
 
 get_node(Nidx) ->
-    case catch mnesia:index_read(pubsub_node, Nidx, #pubsub_node.id) of
+    case mnesia:index_read(pubsub_node, Nidx, #pubsub_node.id) of
 	[Record] when is_record(Record, pubsub_node) -> Record;
-	_ -> {error, ?ERR_ITEM_NOT_FOUND}
+	_ -> {error, xmpp:err_item_not_found(<<"Node not found">>, ?MYLANG)}
     end.
 
 get_nodes(Host, _From) ->
@@ -93,15 +86,26 @@ get_nodes(Host, _From) ->
 get_nodes(Host) ->
     mnesia:match_object(#pubsub_node{nodeid = {Host, '_'}, _ = '_'}).
 
-get_parentnodes(_Host, _Node, _From) ->
-    [].
-
-%% @doc <p>Default node tree does not handle parents, return a list
-%% containing just this node.</p>
-get_parentnodes_tree(Host, Node, _From) ->
+get_parentnodes(Host, Node, _From) ->
     case catch mnesia:read({pubsub_node, {Host, Node}}) of
-	[Record] when is_record(Record, pubsub_node) -> [{0, [Record]}];
-	_ -> []
+	[Record] when is_record(Record, pubsub_node) ->
+	    Record#pubsub_node.parents;
+	_ ->
+	    []
+    end.
+
+get_parentnodes_tree(Host, Node, _From) ->
+    get_parentnodes_tree(Host, Node, 0, []).
+get_parentnodes_tree(Host, Node, Level, Acc) ->
+    case catch mnesia:read({pubsub_node, {Host, Node}}) of
+	[Record] when is_record(Record, pubsub_node) ->
+	    Tree = [{Level, [Record]}|Acc],
+	    case Record#pubsub_node.parents of
+		[Parent] -> get_parentnodes_tree(Host, Parent, Level+1, Tree);
+		_ -> Tree
+	    end;
+	_ ->
+	    Acc
     end.
 
 get_subnodes(Host, Node, _From) ->
@@ -132,11 +136,11 @@ get_subnodes_tree(Host, Node) ->
 	{error, _} ->
 	    [];
 	Rec ->
-	    BasePlugin = jlib:binary_to_atom(<<"node_",
+	    BasePlugin = misc:binary_to_atom(<<"node_",
 			(Rec#pubsub_node.type)/binary>>),
 	    BasePath = BasePlugin:node_to_path(Node),
 	    mnesia:foldl(fun (#pubsub_node{nodeid = {H, N}} = R, Acc) ->
-			Plugin = jlib:binary_to_atom(<<"node_",
+			Plugin = misc:binary_to_atom(<<"node_",
 				    (R#pubsub_node.type)/binary>>),
 			Path = Plugin:node_to_path(N),
 			case lists:prefix(BasePath, Path) and (H == Host) of
@@ -148,8 +152,8 @@ get_subnodes_tree(Host, Node) ->
     end.
 
 create_node(Host, Node, Type, Owner, Options, Parents) ->
-    BJID = jlib:jid_tolower(jlib:jid_remove_resource(Owner)),
-    case catch mnesia:read({pubsub_node, {Host, Node}}) of
+    BJID = jid:tolower(jid:remove_resource(Owner)),
+    case mnesia:read({pubsub_node, {Host, Node}}) of
 	[] ->
 	    ParentExists = case Host of
 		{_U, _S, _R} ->
@@ -162,7 +166,7 @@ create_node(Host, Node, Type, Owner, Options, Parents) ->
 			    true;
 			[Parent | _] ->
 			    case catch mnesia:read({pubsub_node, {Host, Parent}}) of
-				[#pubsub_node{owners = [{[], Host, []}]}] ->
+				[#pubsub_node{owners = [{<<>>, Host, <<>>}]}] ->
 				    true;
 				[#pubsub_node{owners = Owners}] ->
 				    lists:member(BJID, Owners);
@@ -182,10 +186,10 @@ create_node(Host, Node, Type, Owner, Options, Parents) ->
 			    options = Options}),
 		    {ok, Nidx};
 		false ->
-		    {error, ?ERR_FORBIDDEN}
+		    {error, xmpp:err_forbidden()}
 	    end;
 	_ ->
-	    {error, ?ERR_CONFLICT}
+	    {error, xmpp:err_conflict(<<"Node already exists">>, ?MYLANG)}
     end.
 
 delete_node(Host, Node) ->

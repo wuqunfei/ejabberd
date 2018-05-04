@@ -5,7 +5,7 @@
 %%% Created : 27 Feb 2004 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2015   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -31,15 +31,15 @@
 
 %% External exports
 -export([start/2, start_link/2, become_controller/1,
-	 socket_type/0, receive_headers/1, url_encode/1,
-         transform_listen_option/2]).
+	 socket_type/0, receive_headers/1,
+         transform_listen_option/2, listen_opt_type/1]).
 
 -export([init/2, opt_type/1]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("jlib.hrl").
+-include("xmpp.hrl").
 
 -include("ejabberd_http.hrl").
 
@@ -68,7 +68,9 @@
 		end_of_request = false,
 		options = [],
 		default_host,
-		trail = <<>>
+		custom_headers,
+		trail = <<>>,
+		addr_re
 	       }).
 
 -define(XHTML_DOCTYPE,
@@ -84,8 +86,9 @@
 	  "">>).
 
 start(SockData, Opts) ->
-    supervisor:start_child(ejabberd_http_sup,
-			   [SockData, Opts]).
+    {ok,
+     proc_lib:spawn(ejabberd_http, init,
+		    [SockData, Opts])}.
 
 start_link(SockData, Opts) ->
     {ok,
@@ -94,31 +97,26 @@ start_link(SockData, Opts) ->
 
 init({SockMod, Socket}, Opts) ->
     TLSEnabled = proplists:get_bool(tls, Opts),
-    TLSOpts1 = lists:filter(fun ({certfile, _}) -> true;
-				({ciphers, _}) -> true;
+    TLSOpts1 = lists:filter(fun ({ciphers, _}) -> true;
 				({dhfile, _}) -> true;
+				({protocol_options, _}) -> true;
 				(_) -> false
 			    end,
 			    Opts),
-    TLSOpts2 = case lists:keysearch(protocol_options, 1, Opts) of
-                   {value, {_, O}} ->
-                       [_|ProtocolOptions] = lists:foldl(
-                                    fun(X, Acc) -> X ++ Acc end, [],
-                                    [["|" | binary_to_list(Opt)] || Opt <- O, is_binary(Opt)]
-                                   ),
-                        [{protocol_options, iolist_to_binary(ProtocolOptions)} | TLSOpts1];
-                   _ -> TLSOpts1
+    TLSOpts2 = case proplists:get_bool(tls_compression, Opts) of
+                   false -> [compression_none | TLSOpts1];
+                   true -> TLSOpts1
                end,
-    TLSOpts3 = case proplists:get_bool(tls_compression, Opts) of
-                   false -> [compression_none | TLSOpts2];
-                   true -> TLSOpts2
-               end,
+    TLSOpts3 = case get_certfile(Opts) of
+		   undefined -> TLSOpts2;
+		   CertFile -> [{certfile, CertFile}|TLSOpts2]
+	       end,
     TLSOpts = [verify_none | TLSOpts3],
     {SockMod1, Socket1} = if TLSEnabled ->
 				 inet:setopts(Socket, [{recbuf, 8192}]),
-				 {ok, TLSSocket} = p1_tls:tcp_to_tls(Socket,
+				 {ok, TLSSocket} = fast_tls:tcp_to_tls(Socket,
 								  TLSOpts),
-				 {p1_tls, TLSSocket};
+				 {fast_tls, TLSSocket};
 			     true -> {SockMod, Socket}
 			  end,
     Captcha = case proplists:get_bool(captcha, Opts) of
@@ -134,35 +132,38 @@ init({SockMod, Socket}, Opts) ->
               false -> []
             end,
     Bind = case proplists:get_bool(http_bind, Opts) of
-             true -> [{[<<"http-bind">>], mod_http_bind}];
+	     true -> [{[<<"http-bind">>], mod_bosh}];
              false -> []
            end,
     XMLRPC = case proplists:get_bool(xmlrpc, Opts) of
 		 true -> [{[], ejabberd_xmlrpc}];
 		 false -> []
 	     end,
-    DefinedHandlers = gen_mod:get_opt(
-                        request_handlers, Opts,
-                        fun(Hs) ->
-                                [{str:tokens(
-                                    iolist_to_binary(Path), <<"/">>),
-                                  Mod} || {Path, Mod} <- Hs]
-                        end, []),
+    DefinedHandlers = proplists:get_value(request_handlers, Opts, []),
     RequestHandlers = DefinedHandlers ++ Captcha ++ Register ++
         Admin ++ Bind ++ XMLRPC,
     ?DEBUG("S: ~p~n", [RequestHandlers]),
 
-    DefaultHost = gen_mod:get_opt(default_host, Opts, fun(A) -> A end, undefined),
+    DefaultHost = proplists:get_value(default_host, Opts),
+    {ok, RE} = re:compile(<<"^(?:\\[(.*?)\\]|(.*?))(?::(\\d+))?$">>),
 
-    ?INFO_MSG("started: ~p", [{SockMod1, Socket1}]),
+    CustomHeaders = proplists:get_value(custom_headers, Opts, []),
+
     State = #state{sockmod = SockMod1,
                    socket = Socket1,
                    default_host = DefaultHost,
+		   custom_headers = CustomHeaders,
 		   options = Opts,
-                   request_handlers = RequestHandlers},
-    receive_headers(State).
+		   request_handlers = RequestHandlers,
+		   addr_re = RE},
+    try receive_headers(State) of
+        V -> V
+    catch
+        {error, _} -> State
+    end.
 
-become_controller(_Pid) -> ok.
+become_controller(_Pid) ->
+    ok.
 
 socket_type() ->
     raw.
@@ -197,22 +198,20 @@ parse_headers(#state{request_method = Method,
 		     trail = Data} =
 		  State) ->
     PktType = case Method of
-                  undefined -> http_bin;
-                  _ -> httph_bin
-              end,
+		undefined -> http_bin;
+		_ -> httph_bin
+	      end,
     case erlang:decode_packet(PktType, Data, []) of
-        {ok, Pkt, Rest} ->
-            NewState = process_header(State#state{trail = Rest}, {ok, Pkt}),
+	{ok, Pkt, Rest} ->
+	    NewState = process_header(State#state{trail = Rest}, {ok, Pkt}),
 	    case NewState#state.end_of_request of
-		true ->
-		    ok;
-		_ ->
-                    parse_headers(NewState)
+		true -> ok;
+		_ -> parse_headers(NewState)
 	    end;
-        {more, _} ->
-            receive_headers(State#state{trail = Data});
-        _ ->
-            ok
+	{more, _} ->
+	    receive_headers(State#state{trail = Data});
+	_ ->
+	    ok
     end.
 
 process_header(State, Data) ->
@@ -235,7 +234,7 @@ process_header(State, Data) ->
 		      request_version = Version, request_path = Path,
 		      request_keepalive = KeepAlive};
       {ok, {http_header, _, 'Connection' = Name, _, Conn}} ->
-	  KeepAlive1 = case jlib:tolower(Conn) of
+	  KeepAlive1 = case misc:tolower(Conn) of
 			 <<"keep-alive">> -> true;
 			 <<"close">> -> false;
 			 _ -> State#state.request_keepalive
@@ -248,7 +247,7 @@ process_header(State, Data) ->
 		      request_headers = add_header(Name, Auth, State)};
       {ok,
        {http_header, _, 'Content-Length' = Name, _, SLen}} ->
-	  case catch jlib:binary_to_integer(SLen) of
+	  case catch binary_to_integer(SLen) of
 	    Len when is_integer(Len) ->
 		State#state{request_content_length = Len,
 			    request_headers = add_header(Name, SLen, State)};
@@ -262,49 +261,56 @@ process_header(State, Data) ->
 	  State#state{request_host = Host,
 		      request_headers = add_header(Name, Host, State)};
       {ok, {http_header, _, Name, _, Value}} when is_binary(Name) ->
-         State#state{request_headers =
-                         add_header(normalize_header_name(Name),
-                                     Value,
-                                    State)};
+	  State#state{request_headers =
+			  add_header(normalize_header_name(Name), Value, State)};
       {ok, {http_header, _, Name, _, Value}} ->
 	  State#state{request_headers =
 			  add_header(Name, Value, State)};
       {ok, http_eoh}
 	  when State#state.request_host == undefined ->
-	  ?WARNING_MSG("An HTTP request without 'Host' HTTP "
-		       "header was received.",
-		       []),
-	  throw(http_request_no_host_header);
+	    ?DEBUG("An HTTP request without 'Host' HTTP "
+		   "header was received.", []),
+	    {State1, Out} = process_request(State),
+	    send_text(State1, Out),
+	    process_header(State, {ok, {http_error, <<>>}});
       {ok, http_eoh} ->
 	  ?DEBUG("(~w) http query: ~w ~p~n",
 		 [State#state.socket, State#state.request_method,
 		  element(2, State#state.request_path)]),
 	  {HostProvided, Port, TP} =
-	      get_transfer_protocol(SockMod,
+	      get_transfer_protocol(State#state.addr_re, SockMod,
 				    State#state.request_host),
 	  Host = get_host_really_served(State#state.default_host,
 					HostProvided),
 	  State2 = State#state{request_host = Host,
 			       request_port = Port, request_tp = TP},
-	  Out = process_request(State2),
-	  send_text(State2, Out),
-	  case State2#state.request_keepalive of
+	  {State3, Out} = process_request(State2),
+	  send_text(State3, Out),
+	  case State3#state.request_keepalive of
 	    true ->
 		#state{sockmod = SockMod, socket = Socket,
+		       trail = State3#state.trail,
 		       options = State#state.options,
 		       default_host = State#state.default_host,
-		       request_handlers = State#state.request_handlers};
+		       custom_headers = State#state.custom_headers,
+		       request_handlers = State#state.request_handlers,
+		       addr_re = State#state.addr_re};
 	    _ ->
 		#state{end_of_request = true,
+		       trail = State3#state.trail,
 		       options = State#state.options,
 		       default_host = State#state.default_host,
-		       request_handlers = State#state.request_handlers}
+		       custom_headers = State#state.custom_headers,
+		       request_handlers = State#state.request_handlers,
+		       addr_re = State#state.addr_re}
 	  end;
       _ ->
 	  #state{end_of_request = true,
 		 options = State#state.options,
 		 default_host = State#state.default_host,
-		 request_handlers = State#state.request_handlers}
+		 custom_headers = State#state.custom_headers,
+		 request_handlers = State#state.request_handlers,
+		 addr_re = State#state.addr_re}
     end.
 
 add_header(Name, Value, State)->
@@ -313,29 +319,30 @@ add_header(Name, Value, State)->
 get_host_really_served(undefined, Provided) ->
     Provided;
 get_host_really_served(Default, Provided) ->
-    case lists:member(Provided, ?MYHOSTS) of
+    case ejabberd_router:is_my_host(Provided) of
       true -> Provided;
       false -> Default
     end.
 
-%% @spec (SockMod, HostPort) -> {Host::string(), Port::integer(), TP}
-%% where
-%%       SockMod = gen_tcp | tls
-%%       HostPort = string()
-%%       TP = http | https
-%% @doc Given a socket and hostport header, return data of transfer protocol.
-%% Note that HostPort can be a string of a host like "example.org",
-%% or a string of a host and port like "example.org:5280".
-get_transfer_protocol(SockMod, HostPort) ->
-    [Host | PortList] = str:tokens(HostPort, <<":">>),
-    case {SockMod, PortList} of
-      {gen_tcp, []} -> {Host, 80, http};
-      {gen_tcp, [Port]} ->
-	  {Host, jlib:binary_to_integer(Port), http};
-      {p1_tls, []} -> {Host, 443, https};
-      {p1_tls, [Port]} ->
-	  {Host, jlib:binary_to_integer(Port), https}
-    end.
+get_transfer_protocol(RE, SockMod, HostPort) ->
+    {Proto, DefPort} = case SockMod of
+			   gen_tcp -> {http, 80};
+			   fast_tls -> {https, 443}
+		       end,
+    {Host, Port} = case re:run(HostPort, RE, [{capture,[1,2,3],binary}]) of
+		       nomatch ->
+			   {<<"0.0.0.0">>, DefPort};
+		       {match, [<<>>, H, <<>>]} ->
+			   {H, DefPort};
+		       {match, [H, <<>>, <<>>]} ->
+			   {H, DefPort};
+		       {match, [<<>>, H, PortStr]} ->
+			   {H, binary_to_integer(PortStr)};
+		       {match, [H, <<>>, PortStr]} ->
+			   {H, binary_to_integer(PortStr)}
+		   end,
+
+    {Host, Port, Proto}.
 
 %% XXX bard: search through request handlers looking for one that
 %% matches the requested URL path, and pass control to it.  If none is
@@ -373,20 +380,20 @@ process(Handlers, Request, Socket, SockMod, Trail) ->
     end.
 
 extract_path_query(#state{request_method = Method,
-			  request_path = {abs_path, Path}})
+			  request_path = {abs_path, Path}} = State)
     when Method =:= 'GET' orelse
 	   Method =:= 'HEAD' orelse
 	     Method =:= 'DELETE' orelse Method =:= 'OPTIONS' ->
     case catch url_decode_q_split(Path) of
-      {'EXIT', _} -> false;
-      {NPath, Query} ->
-	  LPath = normalize_path([NPE
-			  || NPE <- str:tokens(path_decode(NPath), <<"/">>)]),
-	  LQuery = case catch parse_urlencoded(Query) of
-		     {'EXIT', _Reason} -> [];
-		     LQ -> LQ
-		   end,
-	  {LPath, LQuery, <<"">>}
+	{'EXIT', _} -> {State, false};
+	{NPath, Query} ->
+	    LPath = normalize_path([NPE
+				    || NPE <- str:tokens(path_decode(NPath), <<"/">>)]),
+	    LQuery = case catch parse_urlencoded(Query) of
+			 {'EXIT', _Reason} -> [];
+			 LQ -> LQ
+		     end,
+	    {State, {LPath, LQuery, <<"">>}}
     end;
 extract_path_query(#state{request_method = Method,
 			  request_path = {abs_path, Path},
@@ -395,45 +402,57 @@ extract_path_query(#state{request_method = Method,
 			  socket = _Socket} = State)
     when (Method =:= 'POST' orelse Method =:= 'PUT') andalso
 	   is_integer(Len) ->
-    Data = recv_data(State, Len),
+    case recv_data(State, Len) of
+	error -> {State, false};
+	{NewState, Data} ->
     ?DEBUG("client data: ~p~n", [Data]),
     case catch url_decode_q_split(Path) of
-      {'EXIT', _} -> false;
-      {NPath, _Query} ->
-	  LPath = normalize_path([NPE
-			  || NPE <- str:tokens(path_decode(NPath), <<"/">>)]),
-	  LQuery = case catch parse_urlencoded(Data) of
-		     {'EXIT', _Reason} -> [];
-		     LQ -> LQ
-		   end,
-          {LPath, LQuery, Data}
+        {'EXIT', _} -> {NewState, false};
+        {NPath, _Query} ->
+            LPath = normalize_path([NPE
+                                    || NPE <- str:tokens(path_decode(NPath), <<"/">>)]),
+            LQuery = case catch parse_urlencoded(Data) of
+                         {'EXIT', _Reason} -> [];
+                         LQ -> LQ
+                     end,
+            {NewState, {LPath, LQuery, Data}}
+	    end
     end;
-extract_path_query(_State) ->
-    false.
+extract_path_query(State) ->
+    {State, false}.
 
+process_request(#state{request_host = undefined,
+		       custom_headers = CustomHeaders} = State) ->
+    {State, make_text_output(State, 400, CustomHeaders,
+			     <<"Missing Host header">>)};
 process_request(#state{request_method = Method,
-                       request_auth = Auth,
-                       request_lang = Lang,
-                       sockmod = SockMod,
-                       socket = Socket,
-                       options = Options,
-                       request_host = Host,
-                       request_port = Port,
-                       request_tp = TP,
-                       request_headers = RequestHeaders,
-                       request_handlers = RequestHandlers,
-                       trail = Trail} = State) ->
+		       request_auth = Auth,
+		       request_lang = Lang,
+		       sockmod = SockMod,
+		       socket = Socket,
+		       options = Options,
+		       request_host = Host,
+		       request_port = Port,
+		       request_tp = TP,
+		       request_headers = RequestHeaders,
+		       request_handlers = RequestHandlers,
+		       custom_headers = CustomHeaders,
+		       trail = Trail} = State) ->
     case extract_path_query(State) of
-	false ->
-	    make_bad_request(State);
-	{LPath, LQuery, Data} ->
-	    {ok, IPHere} =
+	{State2, false} ->
+	    {State2, make_bad_request(State)};
+	{State2, {LPath, LQuery, Data}} ->
+	    PeerName =
 		case SockMod of
 		    gen_tcp ->
 			inet:peername(Socket);
 		    _ ->
 			SockMod:peername(Socket)
 		end,
+            IPHere = case PeerName of
+                         {ok, V} -> V;
+                         {error, _} = E -> throw(E)
+                     end,
 	    XFF = proplists:get_value('X-Forwarded-For', RequestHeaders, []),
 	    IP = analyze_ip_xff(IPHere, XFF, Host),
             Request = #request{method = Method,
@@ -448,28 +467,33 @@ process_request(#state{request_method = Method,
 			       opts = Options,
                                headers = RequestHeaders,
                                ip = IP},
-            case process(RequestHandlers, Request, Socket, SockMod, Trail) of
-                        El when is_record(El, xmlel) ->
-                            make_xhtml_output(State, 200, [], El);
-                        {Status, Headers, El}
-                          when is_record(El, xmlel) ->
-                            make_xhtml_output(State, Status, Headers, El);
-                        Output when is_binary(Output) or is_list(Output) ->
-                            make_text_output(State, 200, [], Output);
-                        {Status, Headers, Output}
-                          when is_binary(Output) or is_list(Output) ->
-                            make_text_output(State, Status, Headers, Output);
-                        {Status, Reason, Headers, Output}
-                          when is_binary(Output) or is_list(Output) ->
-                            make_text_output(State, Status, Reason, Headers, Output);
-                        _ ->
-                            none
-	    end
+	    RequestHandlers1 = ejabberd_hooks:run_fold(
+				http_request_handlers, RequestHandlers, [Host, Request]),
+	    Res = case process(RequestHandlers1, Request, Socket, SockMod, Trail) of
+		      El when is_record(El, xmlel) ->
+			  make_xhtml_output(State, 200, CustomHeaders, El);
+		      {Status, Headers, El}
+			when is_record(El, xmlel) ->
+			  make_xhtml_output(State, Status,
+					    Headers ++ CustomHeaders, El);
+		      Output when is_binary(Output) or is_list(Output) ->
+			  make_text_output(State, 200, CustomHeaders, Output);
+		      {Status, Headers, Output}
+			when is_binary(Output) or is_list(Output) ->
+			  make_text_output(State, Status,
+					   Headers ++ CustomHeaders, Output);
+		      {Status, Reason, Headers, Output}
+			when is_binary(Output) or is_list(Output) ->
+			  make_text_output(State, Status, Reason,
+					   Headers ++ CustomHeaders, Output);
+		      _ ->
+			  none
+		  end,
+	    {State2, Res}
     end.
 
 make_bad_request(State) ->
-%% Support for X-Forwarded-From
-    make_xhtml_output(State, 400, [],
+    make_xhtml_output(State, 400, State#state.custom_headers,
 		      ejabberd_web:make_xhtml([#xmlel{name = <<"h1">>,
 						      attrs = [],
 						      children =
@@ -479,12 +503,8 @@ make_bad_request(State) ->
 analyze_ip_xff(IP, [], _Host) -> IP;
 analyze_ip_xff({IPLast, Port}, XFF, Host) ->
     [ClientIP | ProxiesIPs] = str:tokens(XFF, <<", ">>) ++
-				[jlib:ip_to_list(IPLast)],
-    TrustedProxies = ejabberd_config:get_option(
-                       {trusted_proxies, Host},
-                       fun(TPs) ->
-                               [iolist_to_binary(TP) || TP <- TPs]
-                       end, []),
+				[misc:ip_to_list(IPLast)],
+    TrustedProxies = ejabberd_config:get_option({trusted_proxies, Host}, []),
     IPClient = case is_ipchain_trusted(ProxiesIPs,
 				       TrustedProxies)
 		   of
@@ -499,49 +519,66 @@ analyze_ip_xff({IPLast, Port}, XFF, Host) ->
 	       end,
     {IPClient, Port}.
 
+is_ipchain_trusted([], _) -> false;
 is_ipchain_trusted(_UserIPs, all) -> true;
-is_ipchain_trusted(UserIPs, TrustedIPs) ->
-    [] == UserIPs -- [<<"127.0.0.1">> | TrustedIPs].
+is_ipchain_trusted(UserIPs, Masks) ->
+    lists:all(
+	fun(IP) ->
+	    case inet:parse_address(binary_to_list(IP)) of
+		{ok, IP2} ->
+		    lists:any(
+			fun({Mask, MaskLen}) ->
+			    acl:ip_matches_mask(IP2, Mask, MaskLen)
+			end, [{{127,0,0,1}, 8} | Masks]);
+		_ ->
+		    false
+	    end
+	end, UserIPs).
 
 recv_data(State, Len) -> recv_data(State, Len, <<>>).
 
-recv_data(_State, 0, Acc) -> (iolist_to_binary(Acc));
+recv_data(State, 0, Acc) -> {State, Acc};
+recv_data(#state{trail = Trail} = State, Len, <<>>) when byte_size(Trail) > Len ->
+    <<Data:Len/binary, Rest/binary>> = Trail,
+    {State#state{trail = Rest}, Data};
 recv_data(State, Len, Acc) ->
     case State#state.trail of
-      <<>> ->
-	  case (State#state.sockmod):recv(State#state.socket, Len,
-					  300000)
-	      of
-	    {ok, Data} ->
-		recv_data(State, Len - byte_size(Data), <<Acc/binary, Data/binary>>);
-	    _ -> <<"">>
-	  end;
-      _ ->
-	  Trail = (State#state.trail),
-	  recv_data(State#state{trail = <<>>},
-		    Len - byte_size(Trail), <<Acc/binary, Trail/binary>>)
+	<<>> ->
+	    case (State#state.sockmod):recv(State#state.socket,
+					    min(Len, 16#4000000), 300000)
+	    of
+		{ok, Data} ->
+		    recv_data(State, Len - byte_size(Data), <<Acc/binary, Data/binary>>);
+		Err ->
+		    ?DEBUG("Cannot receive HTTP data: ~p", [Err]),
+		    error
+	    end;
+	_ ->
+	    Trail = (State#state.trail),
+	    recv_data(State#state{trail = <<>>},
+		      Len - byte_size(Trail), <<Acc/binary, Trail/binary>>)
     end.
 
 make_xhtml_output(State, Status, Headers, XHTML) ->
     Data = case lists:member(html, Headers) of
-	     true ->
-		 iolist_to_binary([?HTML_DOCTYPE,
-				   xml:element_to_binary(XHTML)]);
-	     _ ->
-		 iolist_to_binary([?XHTML_DOCTYPE,
-				   xml:element_to_binary(XHTML)])
-	   end,
+	true ->
+	    iolist_to_binary([?HTML_DOCTYPE,
+		    fxml:element_to_binary(XHTML)]);
+	_ ->
+	    iolist_to_binary([?XHTML_DOCTYPE,
+		    fxml:element_to_binary(XHTML)])
+    end,
     Headers1 = case lists:keysearch(<<"Content-Type">>, 1,
 				    Headers)
 		   of
 		 {value, _} ->
 		     [{<<"Content-Length">>,
-		       iolist_to_binary(integer_to_list(byte_size(Data)))}
+		       integer_to_binary(byte_size(Data))}
 		      | Headers];
 		 _ ->
 		     [{<<"Content-Type">>, <<"text/html; charset=utf-8">>},
 		      {<<"Content-Length">>,
-		       iolist_to_binary(integer_to_list(byte_size(Data)))}
+		       integer_to_binary(byte_size(Data))}
 		      | Headers]
 	       end,
     HeadersOut = case {State#state.request_version,
@@ -563,7 +600,7 @@ make_xhtml_output(State, Status, Headers, XHTML) ->
 		  end,
 		  HeadersOut),
     SL = [Version,
-	  iolist_to_binary(integer_to_list(Status)), <<" ">>,
+	  integer_to_binary(Status), <<" ">>,
 	  code_to_phrase(Status), <<"\r\n">>],
     Data2 = case State#state.request_method of
 	      'HEAD' -> <<"">>;
@@ -581,12 +618,12 @@ make_text_output(State, Status, Reason, Headers, Text) ->
 		   of
 		 {value, _} ->
 		     [{<<"Content-Length">>,
-		       jlib:integer_to_binary(byte_size(Data))}
+		       integer_to_binary(byte_size(Data))}
 		      | Headers];
 		 _ ->
 		     [{<<"Content-Type">>, <<"text/html; charset=utf-8">>},
 		      {<<"Content-Length">>,
-		       jlib:integer_to_binary(byte_size(Data))}
+		       integer_to_binary(byte_size(Data))}
 		      | Headers]
 	       end,
     HeadersOut = case {State#state.request_version,
@@ -611,7 +648,7 @@ make_text_output(State, Status, Reason, Headers, Text) ->
 		  _ -> Reason
 		end,
     SL = [Version,
-	  jlib:integer_to_binary(Status), <<" ">>,
+	  integer_to_binary(Status), <<" ">>,
 	  NewReason, <<"\r\n">>],
     Data2 = case State#state.request_method of
 	      'HEAD' -> <<"">>;
@@ -626,7 +663,7 @@ parse_lang(Langs) ->
     end.
 
 % Code below is taken (with some modifications) from the yaws webserver, which
-% is distributed under the folowing license:
+% is distributed under the following license:
 %
 % This software (the yaws webserver) is free software.
 % Parts of this software is Copyright (c) Claes Wikstrom <klacke@hyber.org>
@@ -654,7 +691,7 @@ url_decode_q_split(<<>>, Ack) ->
 path_decode(Path) -> path_decode(Path, <<>>).
 
 path_decode(<<$%, Hi, Lo, Tail/binary>>, Acc) ->
-    Hex = hex_to_integer([Hi, Lo]),
+    Hex = list_to_integer([Hi, Lo], 16),
     if Hex == 0 -> exit(badurl);
        true -> ok
     end,
@@ -686,21 +723,10 @@ rest_dir(0, Path, <<H, T/binary>>) ->
     rest_dir(0, <<H, Path/binary>>, T);
 rest_dir(N, Path, <<_H, T/binary>>) -> rest_dir(N, Path, T).
 
-%% hex_to_integer
-
-hex_to_integer(Hex) ->
-    case catch list_to_integer(Hex, 16) of
-      {'EXIT', _} -> old_hex_to_integer(Hex);
-      X -> X
-    end.
-
-old_hex_to_integer(Hex) ->
-    DEHEX = fun (H) when H >= $a, H =< $f -> H - $a + 10;
-		(H) when H >= $A, H =< $F -> H - $A + 10;
-		(H) when H >= $0, H =< $9 -> H - $0
-	    end,
-    lists:foldl(fun (E, Acc) -> Acc * 16 + DEHEX(E) end, 0,
-		Hex).
+expand_custom_headers(Headers) ->
+    lists:map(fun({K, V}) ->
+		      {K, misc:expand_keyword(<<"@VERSION@">>, V, ?VERSION)}
+	      end, Headers).
 
 code_to_phrase(100) -> <<"Continue">>;
 code_to_phrase(101) -> <<"Switching Protocols ">>;
@@ -747,8 +773,11 @@ code_to_phrase(503) -> <<"Service Unavailable">>;
 code_to_phrase(504) -> <<"Gateway Timeout">>;
 code_to_phrase(505) -> <<"HTTP Version Not Supported">>.
 
+-spec parse_auth(binary()) -> {binary(), binary()} | {oauth, binary(), []} | undefined.
 parse_auth(<<"Basic ", Auth64/binary>>) ->
-    Auth = jlib:decode_base64(Auth64),
+    Auth = try base64:decode(Auth64)
+	   catch _:badarg -> <<>>
+	   end,
     %% Auth should be a string with the format: user@server:password
     %% Note that password can contain additional characters '@' and ':'
     case str:chr(Auth, $:) of
@@ -756,8 +785,12 @@ parse_auth(<<"Basic ", Auth64/binary>>) ->
             undefined;
         Pos ->
             {User, <<$:, Pass/binary>>} = erlang:split_binary(Auth, Pos-1),
-            {User, Pass}
+            PassUtf8 = unicode:characters_to_binary(binary_to_list(Pass), utf8),
+            {User, PassUtf8}
     end;
+parse_auth(<<"Bearer ", SToken/binary>>) ->
+    Token = str:strip(SToken),
+    {oauth, Token, []};
 parse_auth(<<_/binary>>) -> undefined.
 
 parse_urlencoded(S) ->
@@ -765,7 +798,7 @@ parse_urlencoded(S) ->
 
 parse_urlencoded(<<$%, Hi, Lo, Tail/binary>>, Last, Cur,
 		 State) ->
-    Hex = hex_to_integer([Hi, Lo]),
+    Hex = list_to_integer([Hi, Lo], 16),
     parse_urlencoded(Tail, Last, <<Cur/binary, Hex>>, State);
 parse_urlencoded(<<$&, Tail/binary>>, _Last, Cur, key) ->
     [{Cur, <<"">>} | parse_urlencoded(Tail,
@@ -784,41 +817,6 @@ parse_urlencoded(<<H, Tail/binary>>, Last, Cur, State) ->
 parse_urlencoded(<<>>, Last, Cur, _State) ->
     [{Last, Cur}];
 parse_urlencoded(undefined, _, _, _) -> [].
-
-
-url_encode(A) ->
-    url_encode(A, <<>>).
-
-url_encode(<<H:8, T/binary>>, Acc) when
-      (H >= $a andalso H =< $z) orelse
-      (H >= $A andalso H =< $Z) orelse
-      (H >= $0 andalso H =< $9) orelse
-      H == $_ orelse
-      H == $. orelse
-      H == $- orelse
-      H == $/ orelse
-      H == $: ->
-    url_encode(T, <<Acc/binary, H>>);
-url_encode(<<H:8, T/binary>>, Acc) ->
-    case integer_to_hex(H) of
-        [X, Y] -> url_encode(T, <<Acc/binary, $%, X, Y>>);
-        [X] -> url_encode(T, <<Acc/binary, $%, $0, X>>)
-    end;
-url_encode(<<>>, Acc) ->
-    Acc.
-
-
-integer_to_hex(I) ->
-    case catch erlang:integer_to_list(I, 16) of
-      {'EXIT', _} -> old_integer_to_hex(I);
-      Int -> Int
-    end.
-
-old_integer_to_hex(I) when I < 10 -> integer_to_list(I);
-old_integer_to_hex(I) when I < 16 -> [I - 10 + $A];
-old_integer_to_hex(I) when I >= 16 ->
-    N = trunc(I / 16),
-    old_integer_to_hex(N) ++ old_integer_to_hex(I rem 16).
 
 % The following code is mostly taken from yaws_ssl.erl
 
@@ -851,6 +849,20 @@ normalize_path([_Parent, <<"..">>|Path], Norm) ->
 normalize_path([Part | Path], Norm) ->
     normalize_path(Path, [Part|Norm]).
 
+-spec get_certfile([proplists:property()]) -> binary() | undefined.
+get_certfile(Opts) ->
+    case lists:keyfind(certfile, 1, Opts) of
+	{_, CertFile} ->
+	    CertFile;
+	false ->
+	    case ejabberd_pkix:get_certfile(?MYNAME) of
+		{ok, CertFile} ->
+		    CertFile;
+		error ->
+		    ejabberd_config:get_option({domain_certfile, ?MYNAME})
+	    end
+    end.
+
 transform_listen_option(captcha, Opts) ->
     [{captcha, true}|Opts];
 transform_listen_option(register, Opts) ->
@@ -873,6 +885,89 @@ transform_listen_option({request_handlers, Hs}, Opts) ->
 transform_listen_option(Opt, Opts) ->
     [Opt|Opts].
 
+-spec opt_type(trusted_proxies) -> fun((all | [binary()]) -> all | [binary()]);
+	      (atom()) -> [atom()].
 opt_type(trusted_proxies) ->
-    fun (TPs) -> [iolist_to_binary(TP) || TP <- TPs] end;
+    fun (all) -> all;
+        (TPs) -> lists:filtermap(
+	    fun(TP) ->
+		case acl:parse_ip_netmask(iolist_to_binary(TP)) of
+		    {ok, Ip, Mask} -> {true, {Ip, Mask}};
+		    _ -> false
+		end
+	    end, TPs)
+    end;
 opt_type(_) -> [trusted_proxies].
+
+-spec listen_opt_type(tls) -> fun((boolean()) -> boolean());
+		     (certfile) -> fun((binary()) -> binary());
+		     (ciphers) -> fun((binary()) -> binary());
+		     (dhfile) -> fun((binary()) -> binary());
+		     (protocol_options) -> fun(([binary()]) -> binary());
+		     (tls_compression) -> fun((boolean()) -> boolean());
+		     (captcha) -> fun((boolean()) -> boolean());
+		     (register) -> fun((boolean()) -> boolean());
+		     (web_admin) -> fun((boolean()) -> boolean());
+		     (http_bind) -> fun((boolean()) -> boolean());
+		     (xmlrpc) -> fun((boolean()) -> boolean());
+		     (request_handlers) -> fun(([{binary(), atom()}]) ->
+						[{binary(), atom()}]);
+		     (default_host) -> fun((binary()) -> binary());
+		     (custom_headers) -> fun(([{binary(), binary()}]) ->
+					      [{binary(), binary()}]);
+		     (atom()) -> [atom()].
+listen_opt_type(tls) ->
+    fun(B) when is_boolean(B) -> B end;
+listen_opt_type(certfile = Opt) ->
+    fun(S) ->
+	    ?WARNING_MSG("Listening option '~s' for ~s is deprecated, use "
+			 "'certfiles' global option instead", [Opt, ?MODULE]),
+	    ejabberd_pkix:add_certfile(S),
+	    iolist_to_binary(S)
+    end;
+listen_opt_type(ciphers) ->
+    fun iolist_to_binary/1;
+listen_opt_type(dhfile) ->
+    fun misc:try_read_file/1;
+listen_opt_type(protocol_options) ->
+    fun(Options) -> str:join(Options, <<"|">>) end;
+listen_opt_type(tls_compression) ->
+    fun(B) when is_boolean(B) -> B end;
+listen_opt_type(captcha) ->
+    fun(B) when is_boolean(B) -> B end;
+listen_opt_type(register) ->
+    fun(B) when is_boolean(B) -> B end;
+listen_opt_type(web_admin) ->
+    fun(B) when is_boolean(B) -> B end;
+listen_opt_type(http_bind) ->
+    fun(B) when is_boolean(B) -> B end;
+listen_opt_type(xmlrpc) ->
+    fun(B) when is_boolean(B) -> B end;
+listen_opt_type(request_handlers) ->
+    fun(Hs) ->
+	    Hs1 = lists:map(fun
+				({Mod, Path}) when is_atom(Mod) -> {Path, Mod};
+				({Path, Mod}) -> {Path, Mod}
+			    end, Hs),
+	    Hs2 = [{str:tokens(
+		      iolist_to_binary(Path), <<"/">>),
+		    Mod} || {Path, Mod} <- Hs1],
+	    [{Path,
+	      case Mod of
+		  mod_http_bind -> mod_bosh;
+		  _ -> Mod
+	      end} || {Path, Mod} <- Hs2]
+    end;
+listen_opt_type(default_host) ->
+    fun(A) -> A end;
+listen_opt_type(custom_headers) ->
+    fun expand_custom_headers/1;
+listen_opt_type(inet) -> fun(B) when is_boolean(B) -> B end;
+listen_opt_type(inet6) -> fun(B) when is_boolean(B) -> B end;
+listen_opt_type(backlog) ->
+    fun(I) when is_integer(I), I>0 -> I end;
+listen_opt_type(accept_interval) ->
+    fun(I) when is_integer(I), I>=0 -> I end;
+listen_opt_type(_) ->
+    %% TODO
+    fun(A) -> A end.

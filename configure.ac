@@ -3,8 +3,8 @@
 
 AC_PREREQ(2.53)
 AC_INIT(ejabberd, m4_esyscmd([echo `git describe --tags 2>/dev/null || echo 0.0` | sed 's/-g.*//;s/-/./' | tr -d '\012']), [ejabberd@process-one.net], [ejabberd])
-REQUIRE_ERLANG_MIN="5.9.1 (Erlang/OTP R15B01)"
-REQUIRE_ERLANG_MAX="9.0.0 (No Max)"
+REQUIRE_ERLANG_MIN="6.4 (Erlang/OTP 17.5)"
+REQUIRE_ERLANG_MAX="100.0.0 (No Max)"
 
 AC_CONFIG_MACRO_DIR([m4])
 
@@ -30,6 +30,7 @@ fi
 
 AC_PATH_TOOL(ERL, erl, , [${extra_erl_path}$PATH])
 AC_PATH_TOOL(ERLC, erlc, , [${extra_erl_path}$PATH])
+AC_PATH_TOOL(EPMD, epmd, , [${extra_erl_path}$PATH])
 
 AC_ERLANG_NEED_ERL
 AC_ERLANG_NEED_ERLC
@@ -65,7 +66,7 @@ if test "x$MAKE" = "x"; then
 fi
 
 # Change default prefix
-AC_PREFIX_DEFAULT(/)
+AC_PREFIX_DEFAULT(/usr/local)
 
 AC_ARG_ENABLE(hipe,
 [AC_HELP_STRING([--enable-hipe], [compile natively with HiPE, not recommended (default: no)])],
@@ -83,13 +84,13 @@ AC_ARG_ENABLE(roster_gateway_workaround,
   *) AC_MSG_ERROR(bad value ${enableval} for --enable-roster-gateway-workaround) ;;
 esac],[roster_gateway_workaround=false])
 
-AC_ARG_ENABLE(transient_supervisors,
-[AC_HELP_STRING([--disable-transient-supervisors], [disable Erlang supervision for transient processes (default: no)])],
+AC_ARG_ENABLE(new_sql_schema,
+[AC_HELP_STRING([--enable-new-sql-schema], [use new SQL schema (default: no)])],
 [case "${enableval}" in
-  yes) transient_supervisors=true ;;
-  no)  transient_supervisors=false ;;
-  *) AC_MSG_ERROR(bad value ${enableval} for --enable-transient_supervisors) ;;
-esac],[transient_supervisors=true])
+  yes) new_sql_schema=true ;;
+  no)  new_sql_schema=false ;;
+  *) AC_MSG_ERROR(bad value ${enableval} for --enable-new-sql-schema) ;;
+esac],[new_sql_schema=false])
 
 AC_ARG_ENABLE(full_xml,
 [AC_HELP_STRING([--enable-full-xml], [use XML features in XMPP stream (ex: CDATA) (default: no, requires XML compliant clients)])],
@@ -108,10 +109,10 @@ AC_ARG_ENABLE(mssql,
 esac],[db_type=generic])
 
 AC_ARG_ENABLE(all,
-[AC_HELP_STRING([--enable-all], [same as --enable-nif --enable-odbc --enable-mysql --enable-pgsql --enable-sqlite --enable-pam --enable-zlib --enable-riak --enable-redis --enable-json --enable-elixir --enable-iconv --enable-debug --enable-lager --enable-tools (useful for Dialyzer checks, default: no)])],
+[AC_HELP_STRING([--enable-all], [same as --enable-odbc --enable-mysql --enable-pgsql --enable-sqlite --enable-pam --enable-zlib --enable-riak --enable-redis --enable-elixir --enable-iconv --enable-stun --enable-sip --enable-debug --enable-tools (useful for Dialyzer checks, default: no)])],
 [case "${enableval}" in
-  yes) nif=true odbc=true mysql=true pgsql=true sqlite=true pam=true zlib=true riak=true redis=true json=true elixir=true iconv=true debug=true lager=true tools=true ;;
-  no) nif=false odbc=false mysql=false pgsql=false sqlite=false pam=false zlib=false riak=false redis=false json=false elixir=false iconv=false debug=false lager=false tools=false ;;
+  yes) odbc=true mysql=true pgsql=true sqlite=true pam=true zlib=true riak=true redis=true elixir=true iconv=true stun=true sip=true debug=true tools=true ;;
+  no) odbc=false mysql=false pgsql=false sqlite=false pam=false zlib=false riak=false redis=false elixir=false iconv=false stun=false sip=false debug=false tools=false ;;
   *) AC_MSG_ERROR(bad value ${enableval} for --enable-all) ;;
 esac],[])
 
@@ -122,14 +123,6 @@ AC_ARG_ENABLE(tools,
   no)  tools=false ;;
   *) AC_MSG_ERROR(bad value ${enableval} for --enable-tools) ;;
 esac],[if test "x$tools" = "x"; then tools=false; fi])
-
-AC_ARG_ENABLE(nif,
-[AC_HELP_STRING([--enable-nif], [replace some functions with C equivalents. Requires Erlang R13B04 or higher (default: no)])],
-[case "${enableval}" in
-  yes) nif=true ;;
-  no)  nif=false ;;
-  *) AC_MSG_ERROR(bad value ${enableval} for --enable-nif) ;;
-esac],[if test "x$nif" = "x"; then nif=false; fi])
 
 AC_ARG_ENABLE(odbc,
 [AC_HELP_STRING([--enable-odbc], [enable pure ODBC support (default: no)])],
@@ -195,14 +188,6 @@ AC_ARG_ENABLE(redis,
   *) AC_MSG_ERROR(bad value ${enableval} for --enable-redis) ;;
 esac],[if test "x$redis" = "x"; then redis=false; fi])
 
-AC_ARG_ENABLE(json,
-[AC_HELP_STRING([--enable-json], [enable JSON support for mod_bosh (default: no)])],
-[case "${enableval}" in
-  yes) json=true ;;
-  no)  json=false ;;
-  *) AC_MSG_ERROR(bad value ${enableval} for --enable-json) ;;
-esac],[if test "x$json" = "x"; then json=false; fi])
-
 AC_ARG_ENABLE(elixir,
 [AC_HELP_STRING([--enable-elixir], [enable Elixir support (default: no)])],
 [case "${enableval}" in
@@ -227,13 +212,37 @@ AC_ARG_ENABLE(debug,
   *) AC_MSG_ERROR(bad value ${enableval} for --enable-debug) ;;
 esac],[if test "x$debug" = "x"; then debug=true; fi])
 
-AC_ARG_ENABLE(lager,
-[AC_HELP_STRING([--enable-lager], [enable lager support (default: yes)])],
+AC_ARG_ENABLE(latest_deps,
+[AC_HELP_STRING([--enable-latest-deps], [makes rebar use latest commits for dependences instead of tagged versions (default: no)])],
 [case "${enableval}" in
-  yes) lager=true ;;
-  no)  lager=false ;;
-  *) AC_MSG_ERROR(bad value ${enableval} for --enable-lager) ;;
-esac],[if test "x$lager" = "x"; then lager=true; fi])
+  yes) latest_deps=true ;;
+  no)  latest_deps=false ;;
+  *) AC_MSG_ERROR(bad value ${enableval} for --enable-latest-deps) ;;
+esac],[if test "x$latest_deps" = "x"; then latest_deps=false; fi])
+
+AC_ARG_ENABLE(system_deps,
+[AC_HELP_STRING([--enable-system-deps], [makes rebar use localy installed dependences instead of downloading them (default: no)])],
+[case "${enableval}" in
+  yes) system_deps=true ;;
+  no)  system_deps=false ;;
+  *) AC_MSG_ERROR(bad value ${enableval} for --enable-system-deps) ;;
+esac],[if test "x$system_deps" = "x"; then system_deps=false; fi])
+
+AC_ARG_ENABLE(stun,
+[AC_HELP_STRING([--enable-stun], [enable STUN/TURN support (default: no)])],
+[case "${enableval}" in
+  yes) stun=true ;;
+  no)  stun=false ;;
+  *) AC_MSG_ERROR(bad value ${enableval} for --enable-stun) ;;
+esac],[if test "x$stun" = "x"; then stun=false; fi])
+
+AC_ARG_ENABLE(sip,
+[AC_HELP_STRING([--enable-sip], [enable SIP support (default: no)])],
+[case "${enableval}" in
+  yes) sip=true ;;
+  no)  sip=false ;;
+  *) AC_MSG_ERROR(bad value ${enableval} for --enable-sip) ;;
+esac],[if test "x$sip" = "x"; then sip=false; fi])
 
 AC_CONFIG_FILES([Makefile
 		 vars.config
@@ -252,6 +261,19 @@ if test "$ENABLEUSER" != ""; then
   echo "allow this system user to start ejabberd: $ENABLEUSER"
   AC_SUBST([INSTALLUSER], [$ENABLEUSER])
 fi
+ENABLEGROUP=""
+AC_ARG_ENABLE(group,
+  [AS_HELP_STRING([--enable-group[[[[=GROUP]]]]], [allow this system group to start ejabberd (default: no)])],
+  [case "${enableval}" in
+     yes) ENABLEGROUP=`groups |head -n 1` ;;
+     no) ENABLEGROUP="" ;;
+     *) ENABLEGROUP=$enableval
+   esac],
+  [])
+if test "$ENABLEGROUP" != ""; then
+  echo "allow this system group to start ejabberd: $ENABLEGROUP"
+  AC_SUBST([INSTALLGROUP], [$ENABLEGROUP])
+fi
 
 ERLANG_DEPRECATED_TYPES_CHECK
 
@@ -262,11 +284,21 @@ if test "$sqlite" = "true"; then
    fi
 fi
 
+enabled_backends=""
+for backend in odbc mysql pgsql sqlite riak redis; do
+    if eval test x\${$backend} = xtrue; then
+       if test "x$enabled_backends" = "x"; then
+          enabled_backends=$backend
+       else
+          enabled_backends="$enabled_backends, $backend"
+       fi
+    fi
+done
+
 AC_SUBST(hipe)
 AC_SUBST(roster_gateway_workaround)
-AC_SUBST(transient_supervisors)
+AC_SUBST(new_sql_schema)
 AC_SUBST(full_xml)
-AC_SUBST(nif)
 AC_SUBST(db_type)
 AC_SUBST(odbc)
 AC_SUBST(mysql)
@@ -276,11 +308,17 @@ AC_SUBST(pam)
 AC_SUBST(zlib)
 AC_SUBST(riak)
 AC_SUBST(redis)
-AC_SUBST(json)
 AC_SUBST(elixir)
 AC_SUBST(iconv)
+AC_SUBST(stun)
+AC_SUBST(sip)
 AC_SUBST(debug)
-AC_SUBST(lager)
 AC_SUBST(tools)
+AC_SUBST(latest_deps)
+AC_SUBST(system_deps)
+AC_SUBST(CFLAGS)
+AC_SUBST(CPPFLAGS)
+AC_SUBST(LDFLAGS)
+AC_SUBST(enabled_backends)
 
 AC_OUTPUT

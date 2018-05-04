@@ -4,7 +4,7 @@
 %%% Purpose : Bytestream process.
 %%% Created : 12 Oct 2006 by Evgeniy Khramtsov <xram@jabber.ru>
 %%%
-%%% ejabberd, Copyright (C) 2002-2015   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -26,7 +26,7 @@
 
 -author('xram@jabber.ru').
 
--behaviour(gen_fsm).
+-behaviour(p1_fsm).
 
 %% gen_fsm callbacks.
 -export([init/1, handle_event/3, handle_sync_event/4,
@@ -38,7 +38,8 @@
 	 stream_established/2]).
 
 -export([start/2, stop/1, start_link/3, activate/2,
-	 relay/3, socket_type/0]).
+	 relay/3, socket_type/0, listen_opt_type/1,
+	 listen_options/0]).
 
 -include("mod_proxy65.hrl").
 
@@ -65,32 +66,24 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 %%-------------------------------
 
 start({gen_tcp, Socket}, Opts1) ->
-    {[Host], Opts} = lists:partition(fun (O) -> is_binary(O)
-				     end,
-				     Opts1),
+    {[{server_host, Host}], Opts} = lists:partition(
+				      fun({server_host, _}) -> true;
+					 (_) -> false
+				      end, Opts1),
     Supervisor = gen_mod:get_module_proc(Host,
 					 ejabberd_mod_proxy65_sup),
     supervisor:start_child(Supervisor,
 			   [Socket, Host, Opts]).
 
 start_link(Socket, Host, Opts) ->
-    gen_fsm:start_link(?MODULE, [Socket, Host, Opts], []).
+    p1_fsm:start_link(?MODULE, [Socket, Host, Opts], []).
 
 init([Socket, Host, Opts]) ->
     process_flag(trap_exit, true),
-    AuthType = gen_mod:get_opt(auth_type, Opts,
-                               fun(plain) -> plain;
-                                  (anonymous) -> anonymous
-                               end, anonymous),
-    Shaper = gen_mod:get_opt(shaper, Opts,
-                             fun(A) when is_atom(A) -> A end,
-                             none),
-    RecvBuf = gen_mod:get_opt(recbuf, Opts,
-                              fun(I) when is_integer(I), I>0 -> I end,
-                              8192),
-    SendBuf = gen_mod:get_opt(sndbuf, Opts,
-                              fun(I) when is_integer(I), I>0 -> I end,
-                              8192),
+    AuthType = gen_mod:get_opt(auth_type, Opts),
+    Shaper = gen_mod:get_opt(shaper, Opts),
+    RecvBuf = gen_mod:get_opt(recbuf, Opts),
+    SendBuf = gen_mod:get_opt(sndbuf, Opts),
     TRef = erlang:send_after(?WAIT_TIMEOUT, self(), stop),
     inet:setopts(Socket,
 		 [{active, true}, {recbuf, RecvBuf}, {sndbuf, SendBuf}]),
@@ -99,9 +92,10 @@ init([Socket, Host, Opts]) ->
 	    socket = Socket, shaper = Shaper, timer = TRef}}.
 
 terminate(_Reason, StateName, #state{sha1 = SHA1}) ->
-    catch mod_proxy65_sm:unregister_stream(SHA1),
+    Mod = gen_mod:ram_db_mod(global, mod_proxy65),
+    Mod:unregister_stream(SHA1),
     if StateName == stream_established ->
-	   ?INFO_MSG("Bytestream terminated", []);
+	   ?INFO_MSG("(~w) Bytestream terminated", [self()]);
        true -> ok
     end.
 
@@ -113,15 +107,15 @@ socket_type() -> raw.
 stop(StreamPid) -> StreamPid ! stop.
 
 activate({P1, J1}, {P2, J2}) ->
-    case catch {gen_fsm:sync_send_all_state_event(P1,
+    case catch {p1_fsm:sync_send_all_state_event(P1,
 						  get_socket),
-		gen_fsm:sync_send_all_state_event(P2, get_socket)}
+		p1_fsm:sync_send_all_state_event(P2, get_socket)}
 	of
       {S1, S2} when is_port(S1), is_port(S2) ->
 	  P1 ! {activate, P2, S2, J1, J2},
 	  P2 ! {activate, P1, S1, J1, J2},
-	  JID1 = jlib:jid_to_string(J1),
-	  JID2 = jlib:jid_to_string(J2),
+	  JID1 = jid:encode(J1),
+	  JID2 = jid:encode(J2),
 	  ?INFO_MSG("(~w:~w) Activated bytestream for ~s "
 		    "-> ~s",
 		    [P1, P2, JID1, JID2]),
@@ -153,7 +147,7 @@ wait_for_auth(Packet,
 	      #state{socket = Socket, host = Host} = StateData) ->
     case mod_proxy65_lib:unpack_auth_request(Packet) of
       {User, Pass} ->
-	  Result = ejabberd_auth:check_password(User, Host, Pass),
+	  Result = ejabberd_auth:check_password(User, <<"">>, Host, Pass),
 	  gen_tcp:send(Socket,
 		       mod_proxy65_lib:make_auth_reply(Result)),
 	  case Result of
@@ -168,8 +162,9 @@ wait_for_request(Packet,
     Request = mod_proxy65_lib:unpack_request(Packet),
     case Request of
       #s5_request{sha1 = SHA1, cmd = connect} ->
-	  case catch mod_proxy65_sm:register_stream(SHA1) of
-	    {atomic, ok} ->
+	  Mod = gen_mod:ram_db_mod(global, mod_proxy65),
+	  case Mod:register_stream(SHA1, self()) of
+	    ok ->
 		inet:setopts(Socket, [{active, false}]),
 		gen_tcp:send(Socket,
 			     mod_proxy65_lib:make_reply(Request)),
@@ -203,7 +198,7 @@ handle_info({tcp, _S, Data}, StateName, StateData)
     when StateName /= wait_for_activation ->
     erlang:cancel_timer(StateData#state.timer),
     TRef = erlang:send_after(?WAIT_TIMEOUT, self(), stop),
-    gen_fsm:send_event(self(), Data),
+    p1_fsm:send_event(self(), Data),
     {next_state, StateName, StateData#state{timer = TRef}};
 %% Activation message.
 handle_info({activate, PeerPid, PeerSocket, IJid, TJid},
@@ -288,3 +283,24 @@ find_maxrate(Shaper, JID1, JID2, Host) ->
     if MaxRate1 == none; MaxRate2 == none -> none;
        true -> lists:max([MaxRate1, MaxRate2])
     end.
+
+listen_opt_type(server_host) ->
+    fun iolist_to_binary/1;
+listen_opt_type(auth_type) ->
+    fun (plain) -> plain;
+	(anonymous) -> anonymous
+    end;
+listen_opt_type(recbuf) ->
+    fun (I) when is_integer(I), I > 0 -> I end;
+listen_opt_type(shaper) -> fun acl:shaper_rules_validator/1;
+listen_opt_type(sndbuf) ->
+    fun (I) when is_integer(I), I > 0 -> I end;
+listen_opt_type(accept_interval) ->
+    fun(I) when is_integer(I), I>=0 -> I end.
+
+listen_options() ->
+    [{auth_type, anonymous},
+     {recbuf, 8192},
+     {sndbuf, 8192},
+     {accept_interval, 0},
+     {shaper, none}].

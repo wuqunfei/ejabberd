@@ -5,7 +5,7 @@
 %%% Created : 23 Sep 2010 by Ahmed Omar
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2015   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,15 +25,15 @@
 
 -module(mod_pres_counter).
 
--behavior(gen_mod).
+-behaviour(gen_mod).
 
--export([start/2, stop/1, check_packet/6,
-	 mod_opt_type/1]).
+-export([start/2, stop/1, reload/3, check_packet/4,
+	 mod_opt_type/1, mod_options/1, depends/2]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("jlib.hrl").
+-include("xmpp.hrl").
 
 -record(pres_counter,
 	{dir, start, count, logged = false}).
@@ -48,38 +48,40 @@ stop(Host) ->
 			  ?MODULE, check_packet, 25),
     ok.
 
-check_packet(_, _User, Server, _PrivacyList,
-	     {From, To, #xmlel{name = Name, attrs = Attrs}}, Dir) ->
-    case Name of
-      <<"presence">> ->
-	  IsSubscription = case xml:get_attr_s(<<"type">>, Attrs)
-			       of
-			     <<"subscribe">> -> true;
-			     <<"subscribed">> -> true;
-			     <<"unsubscribe">> -> true;
-			     <<"unsubscribed">> -> true;
-			     _ -> false
-			   end,
-	  if IsSubscription ->
-		 JID = case Dir of
-			 in -> To;
-			 out -> From
-		       end,
-		 update(Server, JID, Dir);
-	     true -> allow
-	  end;
-      _ -> allow
-    end.
+reload(_Host, _NewOpts, _OldOpts) ->
+    ok.
+
+depends(_Host, _Opts) ->
+    [].
+
+-spec check_packet(allow | deny, ejabberd_c2s:state() | jid(),
+		   stanza(), in | out) -> allow | deny.
+check_packet(Acc, #{jid := JID}, Packet, Dir) ->
+    check_packet(Acc, JID, Packet, Dir);
+check_packet(_, #jid{lserver = LServer},
+	     #presence{from = From, to = To, type = Type}, Dir) ->
+    IsSubscription = case Type of
+			 subscribe -> true;
+			 subscribed -> true;
+			 unsubscribe -> true;
+			 unsubscribed -> true;
+			 _ -> false
+		     end,
+    if IsSubscription ->
+	    JID = case Dir of
+		      in -> To;
+		      out -> From
+		  end,
+	    update(LServer, JID, Dir);
+       true -> allow
+    end;
+check_packet(Acc, _, _, _) ->
+    Acc.
 
 update(Server, JID, Dir) ->
-    StormCount = gen_mod:get_module_opt(Server, ?MODULE, count,
-                                        fun(I) when is_integer(I), I>0 -> I end,
-                                        5),
-    TimeInterval = gen_mod:get_module_opt(Server, ?MODULE, interval,
-                                          fun(I) when is_integer(I), I>0 -> I end,
-                                          60),
-    {MegaSecs, Secs, _MicroSecs} = now(),
-    TimeStamp = MegaSecs * 1000000 + Secs,
+    StormCount = gen_mod:get_module_opt(Server, ?MODULE, count),
+    TimeInterval = gen_mod:get_module_opt(Server, ?MODULE, interval),
+    TimeStamp = p1_time_compat:system_time(seconds),
     case read(Dir) of
       undefined ->
 	  write(Dir,
@@ -99,15 +101,15 @@ update(Server, JID, Dir) ->
 		   in ->
 		       ?WARNING_MSG("User ~s is being flooded, ignoring received "
 				    "presence subscriptions",
-				    [jlib:jid_to_string(JID)]);
+				    [jid:encode(JID)]);
 		   out ->
 		       IP = ejabberd_sm:get_user_ip(JID#jid.luser,
 						    JID#jid.lserver,
 						    JID#jid.lresource),
 		       ?WARNING_MSG("Flooder detected: ~s, on IP: ~s ignoring "
 				    "sent presence subscriptions~n",
-				    [jlib:jid_to_string(JID),
-				     jlib:ip_to_list(IP)])
+				    [jid:encode(JID),
+				     misc:ip_to_list(IP)])
 		 end,
 		 {stop, deny};
 	     true ->
@@ -124,5 +126,7 @@ write(K, V) -> put({pres_counter, K}, V).
 mod_opt_type(count) ->
     fun (I) when is_integer(I), I > 0 -> I end;
 mod_opt_type(interval) ->
-    fun (I) when is_integer(I), I > 0 -> I end;
-mod_opt_type(_) -> [count, interval].
+    fun (I) when is_integer(I), I > 0 -> I end.
+
+mod_options(_) ->
+    [{count, 5}, {interval, 60}].

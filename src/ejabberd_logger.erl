@@ -1,12 +1,11 @@
 %%%-------------------------------------------------------------------
-%%% @author Evgeniy Khramtsov <ekhramtsov@process-one.net>
-%%% @copyright (C) 2013, Evgeniy Khramtsov
-%%% @doc
-%%%
-%%% @end
+%%% File    : ejabberd_logger.erl
+%%% Author  : Evgeniy Khramtsov <ekhramtsov@process-one.net>
+%%% Purpose : ejabberd logger wrapper
 %%% Created : 12 May 2013 by Evgeniy Khramtsov <ekhramtsov@process-one.net>
 %%%
-%%% ejabberd, Copyright (C) 2013-2015   ProcessOne
+%%%
+%%% ejabberd, Copyright (C) 2013-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -28,7 +27,8 @@
 -behaviour(ejabberd_config).
 
 %% API
--export([start/0, reopen_log/0, get/0, set/1, get_log_path/0, opt_type/1]).
+-export([start/0, restart/0, reopen_log/0, rotate_log/0, get/0, set/1,
+	 get_log_path/0, opt_type/1]).
 
 -include("ejabberd.hrl").
 
@@ -37,6 +37,7 @@
 -spec start() -> ok.
 -spec get_log_path() -> string().
 -spec reopen_log() -> ok.
+-spec rotate_log() -> ok.
 -spec get() -> {loglevel(), atom(), string()}.
 -spec set(loglevel() | {loglevel(), list()}) -> {module, module()}.
 
@@ -50,6 +51,7 @@
 %% "ejabberd.log" in current directory.
 %% Note: If the directory where to place the ejabberd log file to not exist,
 %% it is not created and no log file will be generated.
+%% @spec () -> string()
 get_log_path() ->
     case ejabberd_config:env_binary_to_list(ejabberd, log_path) of
 	{ok, Path} ->
@@ -73,8 +75,6 @@ opt_type(log_rate_limit) ->
     fun(I) when is_integer(I), I >= 0 -> I end;
 opt_type(_) ->
     [log_rotate_date, log_rotate_size, log_rotate_count, log_rate_limit].
-
--ifdef(LAGER).
 
 get_integer_env(Name, Default) ->
     case application:get_env(ejabberd, Name) of
@@ -101,7 +101,38 @@ get_string_env(Name, Default) ->
             Default
     end.
 
+%% @spec () -> ok
 start() ->
+    start(4).
+
+-spec start(loglevel()) -> ok.
+start(Level) ->
+    LLevel = get_lager_loglevel(Level),
+    StartedApps = application:which_applications(5000),
+    case lists:keyfind(logger, 1, StartedApps) of
+        %% Elixir logger is started. We assume everything is in place
+        %% to use lager to Elixir logger bridge.
+        {logger, _, _} ->
+            error_logger:info_msg("Ignoring ejabberd logger options, using Elixir Logger.", []),
+            %% Do not start lager, we rely on Elixir Logger
+            do_start_for_logger(LLevel);
+        _ ->
+            do_start(LLevel)
+    end.
+
+do_start_for_logger(Level) ->
+    application:load(sasl),
+    application:set_env(sasl, sasl_error_logger, false),
+    application:load(lager),
+    application:set_env(lager, error_logger_redirect, false),
+    application:set_env(lager, error_logger_whitelist, ['Elixir.Logger.ErrorHandler']),
+    application:set_env(lager, crash_log, false),
+    application:set_env(lager, handlers, [{elixir_logger_backend, [{level, Level}]}]),
+    ejabberd:start_app(lager),
+    ok.
+
+%% Start lager
+do_start(Level) ->
     application:load(sasl),
     application:set_env(sasl, sasl_error_logger, false),
     application:load(lager),
@@ -116,8 +147,8 @@ start() ->
     application:set_env(lager, error_logger_hwm, LogRateLimit),
     application:set_env(
       lager, handlers,
-      [{lager_console_backend, info},
-       {lager_file_backend, [{file, ConsoleLog}, {level, info}, {date, LogRotateDate},
+      [{lager_console_backend, Level},
+       {lager_file_backend, [{file, ConsoleLog}, {level, Level}, {date, LogRotateDate},
                              {count, LogRotateCount}, {size, LogRotateSize}]},
        {lager_file_backend, [{file, ErrorLog}, {level, error}, {date, LogRotateDate},
                              {count, LogRotateCount}, {size, LogRotateSize}]}]),
@@ -126,10 +157,24 @@ start() ->
     application:set_env(lager, crash_log_size, LogRotateSize),
     application:set_env(lager, crash_log_count, LogRotateCount),
     ejabberd:start_app(lager),
+    lists:foreach(fun(Handler) ->
+			  lager:set_loghwm(Handler, LogRateLimit)
+		  end, gen_event:which_handlers(lager_event)),
     ok.
 
+restart() ->
+    Level = ejabberd_config:get_option(loglevel, 4),
+    application:stop(lager),
+    start(Level).
+
+%% @spec () -> ok
 reopen_log() ->
-    lager_crash_log ! rotate,
+    %% Lager detects external log rotation automatically.
+    ok.
+
+%% @spec () -> ok
+rotate_log() ->
+    catch lager_crash_log ! rotate,
     lists:foreach(
       fun({lager_file_backend, File}) ->
               whereis(lager_event) ! {rotate, File};
@@ -137,8 +182,9 @@ reopen_log() ->
               ok
       end, gen_event:which_handlers(lager_event)).
 
+%% @spec () -> {loglevel(), atom(), string()}
 get() ->
-    case lager:get_loglevel(lager_console_backend) of
+    case get_lager_loglevel() of
         none -> {0, no_log, "No log"};
         emergency -> {1, critical, "Critical"};
         alert -> {1, critical, "Critical"};
@@ -150,16 +196,10 @@ get() ->
         debug -> {5, debug, "Debug"}
     end.
 
+%% @spec (loglevel() | {loglevel(), list()}) -> {module, module()}
 set(LogLevel) when is_integer(LogLevel) ->
-    LagerLogLevel = case LogLevel of
-                        0 -> none;
-                        1 -> critical;
-                        2 -> error;
-                        3 -> warning;
-                        4 -> info;
-                        5 -> debug
-                    end,
-    case lager:get_loglevel(lager_console_backend) of
+    LagerLogLevel = get_lager_loglevel(LogLevel),
+    case get_lager_loglevel() of
         LagerLogLevel ->
             ok;
         _ ->
@@ -168,6 +208,8 @@ set(LogLevel) when is_integer(LogLevel) ->
               fun({lager_file_backend, File} = H) when File == ConsoleLog ->
                       lager:set_loglevel(H, LagerLogLevel);
                  (lager_console_backend = H) ->
+                      lager:set_loglevel(H, LagerLogLevel);
+                 (elixir_logger_backend = H) ->
                       lager:set_loglevel(H, LagerLogLevel);
                  (_) ->
                       ok
@@ -178,56 +220,32 @@ set({_LogLevel, _}) ->
     error_logger:error_msg("custom loglevels are not supported for 'lager'"),
     {module, lager}.
 
--else.
+get_lager_loglevel() ->
+    Handlers = get_lager_handlers(),
+    lists:foldl(fun(lager_console_backend, _Acc) ->
+                        lager:get_loglevel(lager_console_backend);
+                   (elixir_logger_backend, _Acc) ->
+                        lager:get_loglevel(elixir_logger_backend);
+                   (_, Acc) ->
+                        Acc
+                end,
+                none, Handlers).
 
-start() ->
-    set(4),
-    LogPath = get_log_path(),
-    error_logger:add_report_handler(p1_logger_h, LogPath),
-    ok.
-
-reopen_log() ->
-    %% TODO: Use the Reopen log API for logger_h ?
-    p1_logger_h:reopen_log(),
-    reopen_sasl_log().
-
-get() ->
-    p1_loglevel:get().
-
-set(LogLevel) ->
-    p1_loglevel:set(LogLevel).
-
-%%%===================================================================
-%%% Internal functions
-%%%===================================================================
-reopen_sasl_log() ->
-    case application:get_env(sasl,sasl_error_logger) of
-	{ok, {file, SASLfile}} ->
-	    error_logger:delete_report_handler(sasl_report_file_h),
-            rotate_sasl_log(SASLfile),
-	    error_logger:add_report_handler(sasl_report_file_h,
-	        {SASLfile, get_sasl_error_logger_type()});
-	_ -> false
-	end,
-    ok.
-
-rotate_sasl_log(Filename) ->
-    case file:read_file_info(Filename) of
-        {ok, _FileInfo} ->
-            file:rename(Filename, [Filename, ".0"]),
-            ok;
-        {error, _Reason} ->
-            ok
+get_lager_loglevel(LogLevel) ->
+    case LogLevel of
+	0 -> none;
+	1 -> critical;
+	2 -> error;
+	3 -> warning;
+	4 -> info;
+	5 -> debug;
+	E -> erlang:error({wrong_loglevel, E})
     end.
 
-%% Function copied from Erlang/OTP lib/sasl/src/sasl.erl which doesn't export it
-get_sasl_error_logger_type () ->
-    case application:get_env (sasl, errlog_type) of
-	{ok, error} -> error;
-	{ok, progress} -> progress;
-	{ok, all} -> all;
-	{ok, Bad} -> exit ({bad_config, {sasl, {errlog_type, Bad}}});
-	_ -> all
+get_lager_handlers() ->
+    case catch gen_event:which_handlers(lager_event) of
+        {'EXIT',noproc} ->
+            [];
+        Result ->
+            Result
     end.
-
--endif.

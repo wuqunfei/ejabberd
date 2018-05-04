@@ -1,34 +1,33 @@
-%%% ====================================================================
-%%% ``The contents of this file are subject to the Erlang Public License,
-%%% Version 1.1, (the "License"); you may not use this file except in
-%%% compliance with the License. You should have received a copy of the
-%%% Erlang Public License along with this software. If not, it can be
-%%% retrieved via the world wide web at http://www.erlang.org/.
+%%%----------------------------------------------------------------------
+%%% File    : node_mb.erl
+%%% Author  : Eric Cestari <ecestari@process-one.net>
+%%% Purpose : PEP microglobing experimentation
+%%% Created : 25 Sep 2008 by Eric Cestari <ecestari@process-one.net>
 %%%
 %%%
-%%% Software distributed under the License is distributed on an "AS IS"
-%%% basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See
-%%% the License for the specific language governing rights and limitations
-%%% under the License.
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
+%%% This program is free software; you can redistribute it and/or
+%%% modify it under the terms of the GNU General Public License as
+%%% published by the Free Software Foundation; either version 2 of the
+%%% License, or (at your option) any later version.
 %%%
-%%% The Initial Developer of the Original Code is ProcessOne.
-%%% Portions created by ProcessOne are Copyright 2006-2015, ProcessOne
-%%% All Rights Reserved.''
-%%% This software is copyright 2006-2015, ProcessOne.
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+%%% General Public License for more details.
 %%%
-%%% @copyright 2006-2015 ProcessOne
-%%% @author Eric Cestari <eric@ohmforce.com>
-%%% @version {@vsn}, {@date} {@time}
-%%% @end
-%%% ====================================================================
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+%%%
+%%%----------------------------------------------------------------------
 
 -module(node_mb).
 -behaviour(gen_pubsub_node).
--author('eric@ohmforce.com').
+-author('ecestari@process-one.net').
 
 -include("pubsub.hrl").
--include("jlib.hrl").
 
 %%% @doc The module <strong>{@module}</strong> is the pep microblog PubSub plugin.
 %%% <p>To be used, mod_pubsub must be configured:<pre>
@@ -37,8 +36,8 @@
 %%%   ignore_pep_from_offline: false
 %%%   plugins:
 %%%     - "flat"
-%%%     - "hometree"
 %%%     - "pep" # Requires mod_caps.
+%%%     - "mb"
 %%%   pep_mapping:
 %%%     "urn:xmpp:microblog:0": "mb"
 %%% </pre></p>
@@ -47,13 +46,14 @@
 -export([init/3, terminate/2, options/0, features/0,
     create_node_permission/6, create_node/2, delete_node/1,
     purge_node/2, subscribe_node/8, unsubscribe_node/4,
-    publish_item/6, delete_item/4, remove_extra_items/3,
+    publish_item/7, delete_item/4, remove_extra_items/3,
     get_entity_affiliations/2, get_node_affiliations/1,
     get_affiliation/2, set_affiliation/3,
     get_entity_subscriptions/2, get_node_subscriptions/1,
     get_subscriptions/2, set_subscriptions/4,
     get_pending_nodes/2, get_states/1, get_state/2,
     set_state/1, get_items/7, get_items/3, get_item/7,
+    get_last_items/3,
     get_item/2, set_item/1, get_item_name/3, node_to_path/1,
     path_to_node/1]).
 
@@ -79,7 +79,8 @@ options() ->
 	{max_payload_size, ?MAX_PAYLOAD_SIZE},
 	{send_last_published_item, on_sub_and_presence},
 	{deliver_notifications, true},
-	{presence_based_delivery, true}].
+	{presence_based_delivery, true},
+	{itemreply, none}].
 
 features() ->
     [<<"create-nodes">>,
@@ -91,7 +92,9 @@ features() ->
 	<<"modify-affiliations">>,
 	<<"outcast-affiliation">>,
 	<<"persistent-items">>,
+	<<"multi-items">>,
 	<<"publish">>,
+	<<"publish-options">>,
 	<<"purge-nodes">>,
 	<<"retract-items">>,
 	<<"retrieve-affiliations">>,
@@ -116,8 +119,9 @@ subscribe_node(Nidx, Sender, Subscriber, AccessModel,
 unsubscribe_node(Nidx, Sender, Subscriber, SubId) ->
     node_pep:unsubscribe_node(Nidx, Sender, Subscriber, SubId).
 
-publish_item(Nidx, Publisher, Model, MaxItems, ItemId, Payload) ->
-    node_pep:publish_item(Nidx, Publisher, Model, MaxItems, ItemId, Payload).
+publish_item(Nidx, Publisher, Model, MaxItems, ItemId, Payload, PubOpts) ->
+    node_pep:publish_item(Nidx, Publisher, Model, MaxItems, ItemId,
+	Payload, PubOpts).
 
 remove_extra_items(Nidx, MaxItems, ItemIds) ->
     node_pep:remove_extra_items(Nidx, MaxItems, ItemIds).
@@ -153,7 +157,7 @@ set_subscriptions(Nidx, Owner, Subscription, SubId) ->
     node_pep:set_subscriptions(Nidx, Owner, Subscription, SubId).
 
 get_pending_nodes(Host, Owner) ->
-    node_hometree:get_pending_nodes(Host, Owner).
+    node_pep:get_pending_nodes(Host, Owner).
 
 get_states(Nidx) ->
     node_pep:get_states(Nidx).
@@ -169,6 +173,9 @@ get_items(Nidx, From, RSM) ->
 
 get_items(Nidx, JID, AccessModel, PresenceSubscription, RosterGroup, SubId, RSM) ->
     node_pep:get_items(Nidx, JID, AccessModel, PresenceSubscription, RosterGroup, SubId, RSM).
+
+get_last_items(Nidx, From, Count) ->
+    node_pep:get_last_items(Nidx, From, Count).
 
 get_item(Nidx, ItemId) ->
     node_pep:get_item(Nidx, ItemId).

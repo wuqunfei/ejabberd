@@ -5,7 +5,7 @@
 %%% Created : 10 Aug 2008 by Badlop <badlop@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2008   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -30,48 +30,89 @@
 
 -include("logger.hrl").
 
--export([start/2, stop/1, compile/1, get_cookie/0,
-	 remove_node/1, set_password/3,
-	 check_password_hash/4, delete_old_users/1,
-	 delete_old_users_vhost/2, ban_account/3,
+-export([start/2, stop/1, reload/3, mod_options/1,
+	 get_commands_spec/0, depends/2]).
+
+% Commands API
+-export([
+	 % Adminsys
+	 compile/1, get_cookie/0,
+	 restart_module/2,
+
+	 % Sessions
 	 num_active_users/2, num_resources/2, resource_num/3,
 	 kick_session/4, status_num/2, status_num/1,
 	 status_list/2, status_list/1, connected_users_info/0,
 	 connected_users_vhost/1, set_presence/7,
-	 user_sessions_info/2, set_nickname/3, get_vcard/3,
+	 get_presence/2, user_sessions_info/2, get_last/2, set_last/4,
+
+	 % Accounts
+	 set_password/3, check_password_hash/4, delete_old_users/1,
+	 delete_old_users_vhost/2, ban_account/3, check_password/3,
+
+	 % vCard
+	 set_nickname/3, get_vcard/3,
 	 get_vcard/4, get_vcard_multi/4, set_vcard/4,
-	 set_vcard/5, add_rosteritem/7, delete_rosteritem/4,
+	 set_vcard/5,
+
+	 % Roster
+	 add_rosteritem/7, delete_rosteritem/4,
 	 process_rosteritems/5, get_roster/2, push_roster/3,
-	 push_roster_all/1, push_alltoall/2, get_last/2,
-	 private_get/4, private_set/3, srg_create/5,
+	 push_roster_all/1, push_alltoall/2,
+	 push_roster_item/5, build_roster_item/3,
+
+	 % Private storage
+	 private_get/4, private_set/3,
+
+	 % Shared roster
+	 srg_create/5,
 	 srg_delete/2, srg_list/1, srg_get_info/2,
 	 srg_get_members/2, srg_user_add/4, srg_user_del/4,
-	 send_message/5, send_stanza_c2s/4, privacy_set/3,
-	 stats/1, stats/2, mod_opt_type/1]).
+
+	 % Send message
+	 send_message/5, send_stanza/3, send_stanza_c2s/4,
+
+	 % Privacy list
+	 privacy_set/3,
+
+	 % Stats
+	 stats/1, stats/2
+	]).
 
 
 -include("ejabberd.hrl").
 -include("ejabberd_commands.hrl").
 -include("mod_roster.hrl").
+-include("mod_privacy.hrl").
 -include("ejabberd_sm.hrl").
--include("jlib.hrl").
+-include("xmpp.hrl").
 
 %%%
 %%% gen_mod
 %%%
 
 start(_Host, _Opts) ->
-    ejabberd_commands:register_commands(commands()).
+    ejabberd_commands:register_commands(get_commands_spec()).
 
-stop(_Host) ->
-    ejabberd_commands:unregister_commands(commands()).
+stop(Host) ->
+    case gen_mod:is_loaded_elsewhere(Host, ?MODULE) of
+	false ->
+	    ejabberd_commands:unregister_commands(get_commands_spec());
+	true ->
+	    ok
+    end.
 
+reload(_Host, _NewOpts, _OldOpts) ->
+    ok.
+
+depends(_Host, _Opts) ->
+    [].
 
 %%%
 %%% Register commands
 %%%
 
-commands() ->
+get_commands_spec() ->
     Vcard1FieldsString = "Some vcard field names in get/set_vcard are:\n"
 	" FN		- Full Name\n"
 	" NICKNAME	- Nickname\n"
@@ -101,90 +142,176 @@ commands() ->
 			desc = "Recompile and reload Erlang source code file",
 			module = ?MODULE, function = compile,
 			args = [{file, string}],
-			result = {res, rescode}},
+			args_example = ["/home/me/srcs/ejabberd/mod_example.erl"],
+			args_desc = ["Filename of erlang source file to compile"],
+			result = {res, rescode},
+			result_example = ok,
+			result_desc = "Status code: 0 on success, 1 otherwise"},
      #ejabberd_commands{name = get_cookie, tags = [erlang],
 			desc = "Get the Erlang cookie of this node",
 			module = ?MODULE, function = get_cookie,
 			args = [],
-			result = {cookie, string}},
-     #ejabberd_commands{name = remove_node, tags = [erlang],
-			desc = "Remove an ejabberd node from Mnesia clustering config",
-			module = ?MODULE, function = remove_node,
-			args = [{node, string}],
-			result = {res, rescode}},
-
+			result = {cookie, string},
+			result_example = "MWTAVMODFELNLSMYXPPD",
+			result_desc = "Erlang cookie used for authentication by ejabberd"},
+    #ejabberd_commands{name = restart_module, tags = [erlang],
+			desc = "Stop an ejabberd module, reload code and start",
+			module = ?MODULE, function = restart_module,
+			args = [{host, binary}, {module, binary}],
+			args_example = ["myserver.com","mod_admin_extra"],
+			args_desc = ["Server name", "Module to restart"],
+			result = {res, integer},
+			result_example = 0,
+			result_desc = "Returns integer code:\n"
+				      " - 0: code reloaded, module restarted\n"
+				      " - 1: error: module not loaded\n"
+				      " - 2: code not reloaded, but module restarted"},
      #ejabberd_commands{name = num_active_users, tags = [accounts, stats],
 			desc = "Get number of users active in the last days",
+			policy = admin,
 			module = ?MODULE, function = num_active_users,
 			args = [{host, binary}, {days, integer}],
-			result = {users, integer}},
+			args_example = [<<"myserver.com">>, 3],
+			args_desc = ["Name of host to check", "Number of days to calculate sum"],
+			result = {users, integer},
+			result_example = 123,
+			result_desc = "Number of users active on given server in last n days"},
      #ejabberd_commands{name = delete_old_users, tags = [accounts, purge],
 			desc = "Delete users that didn't log in last days, or that never logged",
+			longdesc = "To protect admin accounts, configure this for example:\n"
+			    "access_rules:\n"
+			    "  protect_old_users:\n"
+			    "    - allow: admin\n"
+			    "    - deny: all\n",
 			module = ?MODULE, function = delete_old_users,
 			args = [{days, integer}],
-			result = {res, restuple}},
+			args_example = [30],
+			args_desc = ["Last login age in days of accounts that should be removed"],
+			result = {res, restuple},
+			result_example = {ok, <<"Deleted 2 users: [\"oldman@myserver.com\", \"test@myserver.com\"]">>},
+			result_desc = "Result tuple"},
      #ejabberd_commands{name = delete_old_users_vhost, tags = [accounts, purge],
 			desc = "Delete users that didn't log in last days in vhost, or that never logged",
+			longdesc = "To protect admin accounts, configure this for example:\n"
+			    "access_rules:\n"
+			    "  delete_old_users:\n"
+			    "    - deny: admin\n"
+			    "    - allow: all\n",
 			module = ?MODULE, function = delete_old_users_vhost,
 			args = [{host, binary}, {days, integer}],
-			result = {res, restuple}},
-
+			args_example = [<<"myserver.com">>, 30],
+			args_desc = ["Server name",
+				     "Last login age in days of accounts that should be removed"],
+			result = {res, restuple},
+			result_example = {ok, <<"Deleted 2 users: [\"oldman@myserver.com\", \"test@myserver.com\"]">>},
+			result_desc = "Result tuple"},
      #ejabberd_commands{name = check_account, tags = [accounts],
 			desc = "Check if an account exists or not",
-			module = ejabberd_auth, function = is_user_exists,
+			module = ejabberd_auth, function = user_exists,
 			args = [{user, binary}, {host, binary}],
-			result = {res, rescode}},
+			args_example = [<<"peter">>, <<"myserver.com">>],
+			args_desc = ["User name to check", "Server to check"],
+			result = {res, rescode},
+			result_example = ok,
+			result_desc = "Status code: 0 on success, 1 otherwise"},
      #ejabberd_commands{name = check_password, tags = [accounts],
 			desc = "Check if a password is correct",
-			module = ejabberd_auth, function = check_password,
+			module = ?MODULE, function = check_password,
 			args = [{user, binary}, {host, binary}, {password, binary}],
-			result = {res, rescode}},
+			args_example = [<<"peter">>, <<"myserver.com">>, <<"secret">>],
+			args_desc = ["User name to check", "Server to check", "Password to check"],
+			result = {res, rescode},
+			result_example = ok,
+			result_desc = "Status code: 0 on success, 1 otherwise"},
      #ejabberd_commands{name = check_password_hash, tags = [accounts],
 			desc = "Check if the password hash is correct",
-			longdesc = "Allowed hash methods: md5, sha.",
+			longdesc = "Allows hash methods from crypto application",
 			module = ?MODULE, function = check_password_hash,
-			args = [{user, binary}, {host, binary}, {passwordhash, string}, {hashmethod, string}],
-			result = {res, rescode}},
+			args = [{user, binary}, {host, binary}, {passwordhash, binary},
+				{hashmethod, binary}],
+			args_example = [<<"peter">>, <<"myserver.com">>,
+					<<"5ebe2294ecd0e0f08eab7690d2a6ee69">>, <<"md5">>],
+			args_desc = ["User name to check", "Server to check",
+				     "Password's hash value", "Name of hash method"],
+			result = {res, rescode},
+			result_example = ok,
+			result_desc = "Status code: 0 on success, 1 otherwise"},
      #ejabberd_commands{name = change_password, tags = [accounts],
 			desc = "Change the password of an account",
 			module = ?MODULE, function = set_password,
 			args = [{user, binary}, {host, binary}, {newpass, binary}],
-			result = {res, rescode}},
+			args_example = [<<"peter">>, <<"myserver.com">>, <<"blank">>],
+			args_desc = ["User name", "Server name",
+				     "New password for user"],
+			result = {res, rescode},
+			result_example = ok,
+			result_desc = "Status code: 0 on success, 1 otherwise"},
      #ejabberd_commands{name = ban_account, tags = [accounts],
 			desc = "Ban an account: kick sessions and set random password",
 			module = ?MODULE, function = ban_account,
 			args = [{user, binary}, {host, binary}, {reason, binary}],
-			result = {res, rescode}},
-
+			args_example = [<<"attacker">>, <<"myserver.com">>, <<"Spaming other users">>],
+			args_desc = ["User name to ban", "Server name",
+				     "Reason for banning user"],
+			result = {res, rescode},
+			result_example = ok,
+			result_desc = "Status code: 0 on success, 1 otherwise"},
      #ejabberd_commands{name = num_resources, tags = [session],
 			desc = "Get the number of resources of a user",
 			module = ?MODULE, function = num_resources,
 			args = [{user, binary}, {host, binary}],
-			result = {resources, integer}},
+			args_example = [<<"peter">>, <<"myserver.com">>],
+			args_desc = ["User name", "Server name"],
+			result = {resources, integer},
+			result_example = 5,
+			result_desc = "Number of active resources for a user"},
      #ejabberd_commands{name = resource_num, tags = [session],
 			desc = "Resource string of a session number",
 			module = ?MODULE, function = resource_num,
 			args = [{user, binary}, {host, binary}, {num, integer}],
-			result = {resource, string}},
+			args_example = [<<"peter">>, <<"myserver.com">>, 2],
+			args_desc = ["User name", "Server name", "ID of resource to return"],
+			result = {resource, string},
+			result_example = <<"Psi">>,
+			result_desc = "Name of user resource"},
      #ejabberd_commands{name = kick_session, tags = [session],
 			desc = "Kick a user session",
 			module = ?MODULE, function = kick_session,
 			args = [{user, binary}, {host, binary}, {resource, binary}, {reason, binary}],
-			result = {res, rescode}},
+			args_example = [<<"peter">>, <<"myserver.com">>, <<"Psi">>,
+					<<"Stuck connection">>],
+			args_desc = ["User name", "Server name", "User's resource",
+				     "Reason for closing session"],
+			result = {res, rescode},
+			result_example = ok,
+			result_desc = "Status code: 0 on success, 1 otherwise"},
      #ejabberd_commands{name = status_num_host, tags = [session, stats],
 			desc = "Number of logged users with this status in host",
+			policy = admin,
 			module = ?MODULE, function = status_num,
 			args = [{host, binary}, {status, binary}],
-			result = {users, integer}},
+			args_example = [<<"myserver.com">>, <<"dnd">>],
+			args_desc = ["Server name", "Status type to check"],
+			result = {users, integer},
+			result_example = 23,
+			result_desc = "Number of connected sessions with given status type"},
      #ejabberd_commands{name = status_num, tags = [session, stats],
 			desc = "Number of logged users with this status",
+			policy = admin,
 			module = ?MODULE, function = status_num,
 			args = [{status, binary}],
-			result = {users, integer}},
+			args_example = [<<"dnd">>],
+			args_desc = ["Status type to check"],
+			result = {users, integer},
+			result_example = 23,
+			result_desc = "Number of connected sessions with given status type"},
      #ejabberd_commands{name = status_list_host, tags = [session],
 			desc = "List of users logged in host with their statuses",
 			module = ?MODULE, function = status_list,
 			args = [{host, binary}, {status, binary}],
+			args_example = [<<"myserver.com">>, <<"dnd">>],
+			args_desc = ["Server name", "Status type to check"],
+			result_example = [{<<"peter">>,<<"myserver.com">>,<<"tka">>,6,<<"Busy">>}],
 			result = {users, {list,
 					  {userstatus, {tuple, [
 								{user, string},
@@ -198,6 +325,9 @@ commands() ->
 			desc = "List of logged users with this status",
 			module = ?MODULE, function = status_list,
 			args = [{status, binary}],
+			args_example = [<<"dnd">>],
+			args_desc = ["Status type to check"],
+			result_example = [{<<"peter">>,<<"myserver.com">>,<<"tka">>,6,<<"Busy">>}],
 			result = {users, {list,
 					  {userstatus, {tuple, [
 								{user, string},
@@ -212,6 +342,8 @@ commands() ->
 			desc = "List all established sessions and their information",
 			module = ?MODULE, function = connected_users_info,
 			args = [],
+			result_example = [{"user1@myserver.com/tka", "c2s", "127.0.0.1",
+                                           40092, 8, "ejabberd@localhost", 28}],
 			result = {connected_users_info,
 				  {list,
 				   {sessions, {tuple,
@@ -225,16 +357,23 @@ commands() ->
 					       ]}}
 				  }}},
      #ejabberd_commands{name = connected_users_vhost,
-                       tags = [session],
-                       desc = "Get the list of established sessions in a vhost",
-                       module = ?MODULE, function = connected_users_vhost,
-                       args = [{host, binary}],
-                       result = {connected_users_vhost, {list, {sessions, string}}}},
+			tags = [session],
+			desc = "Get the list of established sessions in a vhost",
+			module = ?MODULE, function = connected_users_vhost,
+			args_example = [<<"myexample.com">>],
+			args_desc = ["Server name"],
+			result_example = [<<"user1@myserver.com/tka">>, <<"user2@localhost/tka">>],
+			args = [{host, binary}],
+			result = {connected_users_vhost, {list, {sessions, string}}}},
      #ejabberd_commands{name = user_sessions_info,
 			tags = [session],
 			desc = "Get information about all sessions of a user",
 			module = ?MODULE, function = user_sessions_info,
 			args = [{user, binary}, {host, binary}],
+			args_example = [<<"peter">>, <<"myserver.com">>],
+			args_desc = ["User name", "Server name"],
+			result_example = [{"c2s", "127.0.0.1", 42656,8, "ejabberd@localhost",
+                                           231, <<"dnd">>, <<"tka">>, <<>>}],
 			result = {sessions_info,
 				  {list,
 				   {session, {tuple,
@@ -250,6 +389,31 @@ commands() ->
 					      ]}}
 				  }}},
 
+     #ejabberd_commands{name = get_presence, tags = [session],
+			desc =
+			    "Retrieve the resource with highest priority, "
+			    "and its presence (show and status message) "
+			    "for a given user.",
+			longdesc =
+			    "The 'jid' value contains the user jid "
+			    "with resource.\nThe 'show' value contains "
+			    "the user presence flag. It can take "
+			    "limited values:\n - available\n - chat "
+			    "(Free for chat)\n - away\n - dnd (Do "
+			    "not disturb)\n - xa (Not available, "
+			    "extended away)\n - unavailable (Not "
+			    "connected)\n\n'status' is a free text "
+			    "defined by the user client.",
+			module = ?MODULE, function = get_presence,
+			args = [{user, binary}, {server, binary}],
+			args_example = [<<"peter">>, <<"myexample.com">>],
+			args_desc = ["User name", "Server name"],
+			result_example = {<<"user1@myserver.com/tka">>, <<"dnd">>, <<"Busy">>},
+			result =
+			    {presence,
+			     {tuple,
+			      [{jid, string}, {show, string},
+			       {status, string}]}}},
      #ejabberd_commands{name = set_presence,
 			tags = [session],
 			desc = "Set presence of a session",
@@ -258,24 +422,40 @@ commands() ->
 				{resource, binary}, {type, binary},
 				{show, binary}, {status, binary},
 				{priority, binary}],
+			args_example = [<<"user1">>,<<"myserver.com">>,<<"tka1">>,
+					<<"available">>,<<"away">>,<<"BB">>, <<"7">>],
+			args_desc = ["User name", "Server name", "Resource",
+					"Type: available, error, probe...",
+					"Show: away, chat, dnd, xa.", "Status text",
+					"Priority, provide this value as an integer"],
 			result = {res, rescode}},
 
      #ejabberd_commands{name = set_nickname, tags = [vcard],
 			desc = "Set nickname in a user's vCard",
 			module = ?MODULE, function = set_nickname,
 			args = [{user, binary}, {host, binary}, {nickname, binary}],
+			args_example = [<<"user1">>,<<"myserver.com">>,<<"User 1">>],
+			args_desc = ["User name", "Server name", "Nickname"],
 			result = {res, rescode}},
      #ejabberd_commands{name = get_vcard, tags = [vcard],
 			desc = "Get content from a vCard field",
 			longdesc = Vcard1FieldsString ++ "\n" ++ Vcard2FieldsString ++ "\n\n" ++ VcardXEP,
 			module = ?MODULE, function = get_vcard,
 			args = [{user, binary}, {host, binary}, {name, binary}],
+			args_example = [<<"user1">>,<<"myserver.com">>,<<"NICKNAME">>],
+			args_desc = ["User name", "Server name", "Field name"],
+			result_example = "User 1",
+			result_desc = "Field content",
 			result = {content, string}},
      #ejabberd_commands{name = get_vcard2, tags = [vcard],
-			desc = "Get content from a vCard field",
+			desc = "Get content from a vCard subfield",
 			longdesc = Vcard2FieldsString ++ "\n\n" ++ Vcard1FieldsString ++ "\n" ++ VcardXEP,
 			module = ?MODULE, function = get_vcard,
 			args = [{user, binary}, {host, binary}, {name, binary}, {subname, binary}],
+			args_example = [<<"user1">>,<<"myserver.com">>,<<"N">>, <<"FAMILY">>],
+			args_desc = ["User name", "Server name", "Field name", "Subfield name"],
+			result_example = "Schubert",
+			result_desc = "Field content",
 			result = {content, string}},
      #ejabberd_commands{name = get_vcard2_multi, tags = [vcard],
 			desc = "Get multiple contents from a vCard field",
@@ -289,27 +469,36 @@ commands() ->
 			longdesc = Vcard1FieldsString ++ "\n" ++ Vcard2FieldsString ++ "\n\n" ++ VcardXEP,
 			module = ?MODULE, function = set_vcard,
 			args = [{user, binary}, {host, binary}, {name, binary}, {content, binary}],
+			args_example = [<<"user1">>,<<"myserver.com">>, <<"URL">>, <<"www.example.com">>],
+			args_desc = ["User name", "Server name", "Field name", "Value"],
 			result = {res, rescode}},
      #ejabberd_commands{name = set_vcard2, tags = [vcard],
 			desc = "Set content in a vCard subfield",
 			longdesc = Vcard2FieldsString ++ "\n\n" ++ Vcard1FieldsString ++ "\n" ++ VcardXEP,
 			module = ?MODULE, function = set_vcard,
 			args = [{user, binary}, {host, binary}, {name, binary}, {subname, binary}, {content, binary}],
+			args_example = [<<"user1">>,<<"myserver.com">>,<<"TEL">>, <<"NUMBER">>, <<"123456">>],
+			args_desc = ["User name", "Server name", "Field name", "Subfield name", "Value"],
 			result = {res, rescode}},
      #ejabberd_commands{name = set_vcard2_multi, tags = [vcard],
 			desc = "Set multiple contents in a vCard subfield",
 			longdesc = Vcard2FieldsString ++ "\n\n" ++ Vcard1FieldsString ++ "\n" ++ VcardXEP,
 			module = ?MODULE, function = set_vcard,
-			args = [{user, binary}, {host, binary}, {name, binary}, {subname, binary}, {contents, {list, binary}}],
+			args = [{user, binary}, {host, binary}, {name, binary}, {subname, binary}, {contents, {list, {value, binary}}}],
 			result = {res, rescode}},
 
      #ejabberd_commands{name = add_rosteritem, tags = [roster],
 			desc = "Add an item to a user's roster (supports ODBC)",
+			longdesc = "Group can be several groups separated by ; for example: \"g1;g2;g3\"",
 			module = ?MODULE, function = add_rosteritem,
 			args = [{localuser, binary}, {localserver, binary},
 				{user, binary}, {server, binary},
 				{nick, binary}, {group, binary},
 				{subs, binary}],
+			args_example = [<<"user1">>,<<"myserver.com">>,<<"user2">>, <<"myserver.com">>,
+				<<"User 2">>, <<"Friends">>, <<"both">>],
+			args_desc = ["User name", "Server name", "Contact user name", "Contact server name",
+				"Nickname", "Group", "Subscription"],
 			result = {res, rescode}},
      %%{"", "subs= none, from, to or both"},
      %%{"", "example: add-roster peter localhost mike server.com MiKe Employees both"},
@@ -319,9 +508,11 @@ commands() ->
 			module = ?MODULE, function = delete_rosteritem,
 			args = [{localuser, binary}, {localserver, binary},
 				{user, binary}, {server, binary}],
+			args_example = [<<"user1">>,<<"myserver.com">>,<<"user2">>, <<"myserver.com">>],
+			args_desc = ["User name", "Server name", "Contact user name", "Contact server name"],
 			result = {res, rescode}},
      #ejabberd_commands{name = process_rosteritems, tags = [roster],
-			desc = "List or delete rosteritems that match filtering options",
+			desc = "List/delete rosteritems that match filter (only Mnesia)",
 			longdesc = "Explanation of each argument:\n"
 			" - action: what to do with each rosteritem that "
 			"matches all the filtering options\n"
@@ -361,8 +552,9 @@ commands() ->
 				  }}},
      #ejabberd_commands{name = get_roster, tags = [roster],
 			desc = "Get roster of a local user",
+                        policy = user,
 			module = ?MODULE, function = get_roster,
-			args = [{user, binary}, {host, binary}],
+			args = [],
 			result = {contacts, {list, {contact, {tuple, [
 								      {jid, string},
 								      {nick, string},
@@ -372,44 +564,72 @@ commands() ->
 								     ]}}}}},
      #ejabberd_commands{name = push_roster, tags = [roster],
 			desc = "Push template roster from file to a user",
+			longdesc = "The text file must contain an erlang term: a list "
+			    "of tuples with username, servername, group and nick. Example:\n"
+			    "[{\"user1\", \"localhost\", \"Workers\", \"User 1\"},\n"
+			    " {\"user2\", \"localhost\", \"Workers\", \"User 2\"}].",
 			module = ?MODULE, function = push_roster,
 			args = [{file, binary}, {user, binary}, {host, binary}],
+			args_example = [<<"/home/ejabberd/roster.txt">>, <<"user1">>, <<"localhost">>],
+			args_desc = ["File path", "User name", "Server name"],
 			result = {res, rescode}},
      #ejabberd_commands{name = push_roster_all, tags = [roster],
 			desc = "Push template roster from file to all those users",
+			longdesc = "The text file must contain an erlang term: a list "
+			    "of tuples with username, servername, group and nick. Example:\n"
+			    "[{\"user1\", \"localhost\", \"Workers\", \"User 1\"},\n"
+			    " {\"user2\", \"localhost\", \"Workers\", \"User 2\"}].",
 			module = ?MODULE, function = push_roster_all,
 			args = [{file, binary}],
+			args_example = [<<"/home/ejabberd/roster.txt">>],
+			args_desc = ["File path"],
 			result = {res, rescode}},
      #ejabberd_commands{name = push_alltoall, tags = [roster],
 			desc = "Add all the users to all the users of Host in Group",
 			module = ?MODULE, function = push_alltoall,
 			args = [{host, binary}, {group, binary}],
+			args_example = [<<"myserver.com">>,<<"Everybody">>],
+			args_desc = ["Server name", "Group name"],
 			result = {res, rescode}},
 
      #ejabberd_commands{name = get_last, tags = [last],
-			desc = "Get last activity information (timestamp and status)",
-			longdesc = "Timestamp is the seconds since"
-			"1970-01-01 00:00:00 UTC, for example: date +%s",
+			desc = "Get last activity information",
+			longdesc = "Timestamp is UTC and XEP-0082 format, for example: "
+			    "2017-02-23T22:25:28.063062Z     ONLINE",
 			module = ?MODULE, function = get_last,
 			args = [{user, binary}, {host, binary}],
-			result = {last_activity, string}},
+			args_example = [<<"user1">>,<<"myserver.com">>],
+			args_desc = ["User name", "Server name"],
+			result_example = {<<"2017-06-30T14:32:16.060684Z">>, "ONLINE"},
+			result_desc = "Last activity timestamp and status",
+			result = {last_activity,
+				  {tuple, [{timestamp, string},
+					   {status, string}
+					  ]}}},
      #ejabberd_commands{name = set_last, tags = [last],
 			desc = "Set last activity information",
-			longdesc = "Timestamp is the seconds since"
+			longdesc = "Timestamp is the seconds since "
 			"1970-01-01 00:00:00 UTC, for example: date +%s",
-			module = mod_last, function = store_last_info,
+			module = ?MODULE, function = set_last,
 			args = [{user, binary}, {host, binary}, {timestamp, integer}, {status, binary}],
+			args_example = [<<"user1">>,<<"myserver.com">>, 1500045311, <<"GoSleeping">>],
+			args_desc = ["User name", "Server name", "Number of seconds since epoch", "Status message"],
 			result = {res, rescode}},
 
      #ejabberd_commands{name = private_get, tags = [private],
 			desc = "Get some information from a user private storage",
 			module = ?MODULE, function = private_get,
 			args = [{user, binary}, {host, binary}, {element, binary}, {ns, binary}],
+			args_example = [<<"user1">>,<<"myserver.com">>,<<"storage">>, <<"storage:rosternotes">>],
+			args_desc = ["User name", "Server name", "Element name", "Namespace"],
 			result = {res, string}},
      #ejabberd_commands{name = private_set, tags = [private],
 			desc = "Set to the user private storage",
 			module = ?MODULE, function = private_set,
 			args = [{user, binary}, {host, binary}, {element, binary}],
+			args_example = [<<"user1">>,<<"myserver.com">>,
+                            <<"<query xmlns='jabber:iq:private'> <storage xmlns='storage:rosternotes'/></query>">>],
+			args_desc = ["User name", "Server name", "XML storage element"],
 			result = {res, rescode}},
 
      #ejabberd_commands{name = srg_create, tags = [shared_roster_group],
@@ -419,130 +639,220 @@ commands() ->
 			"put  \\ \" around the argument and\nseparate the "
 			"identifiers with \\ \\ n\n"
 			"For example:\n"
-			"  ejabberdctl srg_create group3 localhost "
+			"  ejabberdctl srg_create group3 myserver.com "
 			"name desc \\\"group1\\\\ngroup2\\\"",
 			module = ?MODULE, function = srg_create,
 			args = [{group, binary}, {host, binary},
 				{name, binary}, {description, binary}, {display, binary}],
+			args_example = [<<"group3">>, <<"myserver.com">>, <<"Group3">>,
+				<<"Third group">>, <<"group1\\\\ngroup2">>],
+			args_desc = ["Group identifier", "Group server name", "Group name",
+				"Group description", "Groups to display"],
 			result = {res, rescode}},
      #ejabberd_commands{name = srg_delete, tags = [shared_roster_group],
 			desc = "Delete a Shared Roster Group",
 			module = ?MODULE, function = srg_delete,
 			args = [{group, binary}, {host, binary}],
+			args_example = [<<"group3">>, <<"myserver.com">>],
+			args_desc = ["Group identifier", "Group server name"],
 			result = {res, rescode}},
      #ejabberd_commands{name = srg_list, tags = [shared_roster_group],
 			desc = "List the Shared Roster Groups in Host",
 			module = ?MODULE, function = srg_list,
 			args = [{host, binary}],
+			args_example = [<<"myserver.com">>],
+			args_desc = ["Server name"],
+			result_example = [<<"group1">>, <<"group2">>],
+			result_desc = "List of group identifiers",
 			result = {groups, {list, {id, string}}}},
      #ejabberd_commands{name = srg_get_info, tags = [shared_roster_group],
 			desc = "Get info of a Shared Roster Group",
 			module = ?MODULE, function = srg_get_info,
 			args = [{group, binary}, {host, binary}],
+			args_example = [<<"group3">>, <<"myserver.com">>],
+			args_desc = ["Group identifier", "Group server name"],
+			result_example = [{<<"name">>, "Group 3"}, {<<"displayed_groups">>, "group1"}],
+			result_desc = "List of group informations, as key and value",
 			result = {informations, {list, {information, {tuple, [{key, string}, {value, string}]}}}}},
      #ejabberd_commands{name = srg_get_members, tags = [shared_roster_group],
 			desc = "Get members of a Shared Roster Group",
 			module = ?MODULE, function = srg_get_members,
 			args = [{group, binary}, {host, binary}],
+			args_example = [<<"group3">>, <<"myserver.com">>],
+			args_desc = ["Group identifier", "Group server name"],
+			result_example = [<<"user1@localhost">>, <<"user2@localhost">>],
+			result_desc = "List of group identifiers",
 			result = {members, {list, {member, string}}}},
      #ejabberd_commands{name = srg_user_add, tags = [shared_roster_group],
 			desc = "Add the JID user@host to the Shared Roster Group",
 			module = ?MODULE, function = srg_user_add,
 			args = [{user, binary}, {host, binary}, {group, binary}, {grouphost, binary}],
+			args_example = [<<"user1">>, <<"myserver.com">>, <<"group3">>, <<"myserver.com">>],
+			args_desc = ["Username", "User server name", "Group identifier", "Group server name"],
 			result = {res, rescode}},
      #ejabberd_commands{name = srg_user_del, tags = [shared_roster_group],
 			desc = "Delete this JID user@host from the Shared Roster Group",
 			module = ?MODULE, function = srg_user_del,
 			args = [{user, binary}, {host, binary}, {group, binary}, {grouphost, binary}],
+			args_example = [<<"user1">>, <<"myserver.com">>, <<"group3">>, <<"myserver.com">>],
+			args_desc = ["Username", "User server name", "Group identifier", "Group server name"],
 			result = {res, rescode}},
 
+     #ejabberd_commands{name = get_offline_count,
+			tags = [offline],
+			desc = "Get the number of unread offline messages",
+			policy = user,
+			module = mod_offline, function = count_offline_messages,
+			args = [],
+			result_example = 5,
+			result_desc = "Number",
+			result = {value, integer}},
      #ejabberd_commands{name = send_message, tags = [stanza],
 			desc = "Send a message to a local or remote bare of full JID",
 			module = ?MODULE, function = send_message,
 			args = [{type, binary}, {from, binary}, {to, binary},
 				{subject, binary}, {body, binary}],
+			args_example = [<<"headline">>, <<"admin@localhost">>, <<"user1@localhost">>,
+				<<"Restart">>, <<"In 5 minutes">>],
+			args_desc = ["Message type: normal, chat, headline", "Sender JID",
+				"Receiver JID", "Subject, or empty string", "Body"],
 			result = {res, rescode}},
      #ejabberd_commands{name = send_stanza_c2s, tags = [stanza],
 			desc = "Send a stanza as if sent from a c2s session",
 			module = ?MODULE, function = send_stanza_c2s,
 			args = [{user, binary}, {host, binary}, {resource, binary}, {stanza, binary}],
+			args_example = [<<"admin">>, <<"myserver.com">>, <<"bot">>,
+				<<"<message to='user1@localhost'><ext attr='value'/></message>">>],
+			args_desc = ["Username", "Server name", "Resource", "Stanza"],
+			result = {res, rescode}},
+     #ejabberd_commands{name = send_stanza, tags = [stanza],
+			desc = "Send a stanza; provide From JID and valid To JID",
+			module = ?MODULE, function = send_stanza,
+			args = [{from, binary}, {to, binary}, {stanza, binary}],
+			args_example = [<<"admin@localhost">>, <<"user1@localhost">>,
+				<<"<message><ext attr='value'/></message>">>],
+			args_desc = ["Sender JID", "Destination JID", "Stanza"],
 			result = {res, rescode}},
      #ejabberd_commands{name = privacy_set, tags = [stanza],
 			desc = "Send a IQ set privacy stanza for a local account",
 			module = ?MODULE, function = privacy_set,
 			args = [{user, binary}, {host, binary}, {xmlquery, binary}],
+			args_example = [<<"user1">>, <<"myserver.com">>,
+				<<"<query xmlns='jabber:iq:privacy'>...">>],
+			args_desc = ["Username", "Server name", "Query XML element"],
 			result = {res, rescode}},
 
      #ejabberd_commands{name = stats, tags = [stats],
-			desc = "Get statistical value: registeredusers onlineusers onlineusersnode uptimeseconds",
+			desc = "Get statistical value: registeredusers onlineusers onlineusersnode uptimeseconds processes",
+			policy = admin,
 			module = ?MODULE, function = stats,
 			args = [{name, binary}],
+			args_example = [<<"registeredusers">>],
+			args_desc = ["Statistic name"],
+			result_example = 6,
+			result_desc = "Integer statistic value",
 			result = {stat, integer}},
      #ejabberd_commands{name = stats_host, tags = [stats],
 			desc = "Get statistical value for this host: registeredusers onlineusers",
+			policy = admin,
 			module = ?MODULE, function = stats,
 			args = [{name, binary}, {host, binary}],
+			args_example = [<<"registeredusers">>, <<"example.com">>],
+			args_desc = ["Statistic name", "Server JID"],
+			result_example = 6,
+			result_desc = "Integer statistic value",
 			result = {stat, integer}}
     ].
 
 
 %%%
-%%% Node
+%%% Adminsys
 %%%
 
 compile(File) ->
-    compile:file(File).
+    Ebin = filename:join(code:lib_dir(ejabberd), "ebin"),
+    case ext_mod:compile_erlang_file(Ebin, File) of
+	{ok, Module} ->
+	    code:purge(Module),
+	    code:load_file(Module),
+	    ok;
+	_ ->
+	    error
+    end.
 
 get_cookie() ->
     atom_to_list(erlang:get_cookie()).
 
-remove_node(Node) ->
-    mnesia:del_table_copy(schema, list_to_atom(Node)),
-    ok.
+restart_module(Host, Module) when is_binary(Module) ->
+    restart_module(Host, misc:binary_to_atom(Module));
+restart_module(Host, Module) when is_atom(Module) ->
+    case gen_mod:is_loaded(Host, Module) of
+	false ->
+	    % not a running module, force code reload anyway
+	    code:purge(Module),
+	    code:delete(Module),
+	    code:load_file(Module),
+	    1;
+	true ->
+	    gen_mod:stop_module(Host, Module),
+	    case code:soft_purge(Module) of
+		true ->
+		    code:delete(Module),
+		    code:load_file(Module),
+		    gen_mod:start_module(Host, Module),
+		    0;
+		false ->
+		    gen_mod:start_module(Host, Module),
+		    2
+	    end
+    end.
 
 %%%
 %%% Accounts
 %%%
 
 set_password(User, Host, Password) ->
-    case ejabberd_auth:set_password(User, Host, Password) of
-	ok ->
-	    ok;
-	_ ->
-	    error
-    end.
+    Fun = fun () -> ejabberd_auth:set_password(User, Host, Password) end,
+    user_action(User, Host, Fun, ok).
+
+check_password(User, Host, Password) ->
+    ejabberd_auth:check_password(User, <<>>, Host, Password).
 
 %% Copied some code from ejabberd_commands.erl
 check_password_hash(User, Host, PasswordHash, HashMethod) ->
     AccountPass = ejabberd_auth:get_password_s(User, Host),
-    AccountPassHash = case {AccountPass, HashMethod} of
+    Methods = lists:map(fun(A) -> atom_to_binary(A, latin1) end,
+                   proplists:get_value(hashs, crypto:supports())),
+    MethodAllowed = lists:member(HashMethod, Methods),
+    AccountPassHash = case {AccountPass, MethodAllowed} of
 			  {A, _} when is_tuple(A) -> scrammed;
-			  {_, "md5"} -> get_md5(AccountPass);
-			  {_, "sha"} -> get_sha(AccountPass);
-			  _ -> undefined
+			  {_, true} -> get_hash(AccountPass, HashMethod);
+			  {_, false} ->
+			      ?ERROR_MSG("check_password_hash called "
+					 "with hash method: ~p", [HashMethod]),
+			      undefined
 		      end,
     case AccountPassHash of
 	scrammed ->
-	    ?ERROR_MSG("Passwords are scrammed, and check_password_hash can not work.", []),
+	    ?ERROR_MSG("Passwords are scrammed, and check_password_hash cannot work.", []),
 	    throw(passwords_scrammed_command_cannot_work);
-	undefined -> error;
+	undefined -> throw(unkown_hash_method);
 	PasswordHash -> ok;
-	_ -> error
+	_ -> false
     end.
-get_md5(AccountPass) ->
-    lists:flatten([io_lib:format("~.16B", [X])
-		   || X <- binary_to_list(erlang:md5(AccountPass))]).
-get_sha(AccountPass) ->
-    lists:flatten([io_lib:format("~.16B", [X])
-		   || X <- binary_to_list(p1_sha:sha1(AccountPass))]).
+
+get_hash(AccountPass, Method) ->
+    iolist_to_binary([io_lib:format("~2.16.0B", [X])
+          || X <- binary_to_list(
+              crypto:hash(binary_to_atom(Method, latin1), AccountPass))]).
 
 num_active_users(Host, Days) ->
-    list_last_activity(Host, true, Days).
+    DB_Type = gen_mod:get_module_opt(Host, mod_last, db_type),
+    list_last_activity(Host, true, Days, DB_Type).
 
 %% Code based on ejabberd/src/web/ejabberd_web_admin.erl
-list_last_activity(Host, Integral, Days) ->
-    {MegaSecs, Secs, _MicroSecs} = now(),
-    TimeStamp = MegaSecs * 1000000 + Secs,
+list_last_activity(Host, Integral, Days, mnesia) ->
+    TimeStamp = p1_time_compat:system_time(seconds),
     TS = TimeStamp - Days * 86400,
     case catch mnesia:dirty_select(
 		 last_activity, [{{last_activity, {'_', Host}, '$1', '_'},
@@ -567,7 +877,11 @@ list_last_activity(Host, Integral, Days) ->
 				end,
 			 lists:nth(Days, Hist ++ Tail)
 		 end
-	 end.
+	 end;
+list_last_activity(_Host, _Integral, _Days, DB_Type) ->
+    throw({error, iolist_to_binary(io_lib:format("Unsupported backend: ~p",
+						 [DB_Type]))}).
+
 histogram(Values, Integral) ->
     histogram(lists:sort(Values), Integral, 0, 0, []).
 histogram([H | T], Integral, Current, Count, Hist) when Current == H ->
@@ -590,66 +904,47 @@ histogram([], _Integral, _Current, Count, Hist) ->
 
 delete_old_users(Days) ->
     %% Get the list of registered users
-    Users = ejabberd_auth:dirty_get_registered_users(),
+    Users = ejabberd_auth:get_users(),
 
     {removed, N, UR} = delete_old_users(Days, Users),
     {ok, io_lib:format("Deleted ~p users: ~p", [N, UR])}.
 
 delete_old_users_vhost(Host, Days) ->
     %% Get the list of registered users
-    Users = ejabberd_auth:get_vh_registered_users(Host),
+    Users = ejabberd_auth:get_users(Host),
 
     {removed, N, UR} = delete_old_users(Days, Users),
     {ok, io_lib:format("Deleted ~p users: ~p", [N, UR])}.
 
 delete_old_users(Days, Users) ->
-    %% Convert older time
     SecOlder = Days*24*60*60,
-
-    %% Get current time
-    {MegaSecs, Secs, _MicroSecs} = now(),
-    TimeStamp_now = MegaSecs * 1000000 + Secs,
-
-    %% For a user, remove if required and answer true
+    TimeStamp_now = p1_time_compat:system_time(seconds),
+    TimeStamp_oldest = TimeStamp_now - SecOlder,
     F = fun({LUser, LServer}) ->
-		%% Check if the user is logged
-		case ejabberd_sm:get_user_resources(LUser, LServer) of
-		    %% If it isnt
-		    [] ->
-			%% Look for his last_activity
-			case mod_last:get_last_info(LUser, LServer) of
-			    %% If it is
-			    %% existent:
-			    {ok, TimeStamp, _Status} ->
-				%% get his age
-				Sec = TimeStamp_now - TimeStamp,
-				%% If he is
-				if
-				    %% younger than SecOlder:
-				    Sec < SecOlder ->
-					%% do nothing
-					false;
-				    %% older:
-				    true ->
-					%% remove the user
-					ejabberd_auth:remove_user(LUser, LServer),
-					true
-				end;
-			    %% nonexistent:
-			    not_found ->
-				%% remove the user
-				ejabberd_auth:remove_user(LUser, LServer),
-				true
-			end;
-		    %% Else
-		    _ ->
-			%% do nothing
-			false
-		end
+	    case catch delete_or_not(LUser, LServer, TimeStamp_oldest) of
+		true ->
+		    ejabberd_auth:remove_user(LUser, LServer),
+		    true;
+		_ ->
+		    false
+	    end
 	end,
-    %% Apply the function to every user in the list
     Users_removed = lists:filter(F, Users),
     {removed, length(Users_removed), Users_removed}.
+
+delete_or_not(LUser, LServer, TimeStamp_oldest) ->
+    deny = acl:match_rule(LServer, protect_old_users, jid:make(LUser, LServer)),
+    [] = ejabberd_sm:get_user_resources(LUser, LServer),
+    case mod_last:get_last_info(LUser, LServer) of
+        {ok, TimeStamp, _Status} ->
+	    if TimeStamp_oldest < TimeStamp ->
+		    false;
+		true ->
+		    true
+	    end;
+	not_found ->
+	    true
+    end.
 
 %%
 %% Ban account
@@ -665,28 +960,16 @@ kick_sessions(User, Server, Reason) ->
       fun(Resource) ->
 	      kick_this_session(User, Server, Resource, Reason)
       end,
-      get_resources(User, Server)).
-
-get_resources(User, Server) ->
-    lists:map(
-      fun(Session) ->
-	      element(3, Session#session.usr)
-      end,
-      get_sessions(User, Server)).
-
-get_sessions(User, Server) ->
-    LUser = jlib:nodeprep(User),
-    LServer = jlib:nameprep(Server),
-    Sessions =  mnesia:dirty_index_read(session, {LUser, LServer}, #session.us),
-    true = is_list(Sessions),
-    Sessions.
+      ejabberd_sm:get_user_resources(User, Server)).
 
 set_random_password(User, Server, Reason) ->
     NewPass = build_random_password(Reason),
     set_password_auth(User, Server, NewPass).
 
 build_random_password(Reason) ->
-    Date = jlib:timestamp_to_iso(calendar:universal_time()),
+    {{Year, Month, Day}, {Hour, Minute, Second}} = calendar:universal_time(),
+    Date = str:format("~4..0B~2..0B~2..0BT~2..0B:~2..0B:~2..0B",
+		      [Year, Month, Day, Hour, Minute, Second]),
     RandomString = randoms:get_string(),
     <<"BANNED_ACCOUNT--", Date/binary, "--", RandomString/binary, "--", Reason/binary>>.
 
@@ -713,7 +996,8 @@ resource_num(User, Host, Num) ->
 	true ->
 	    lists:nth(Num, Resources);
 	false ->
-	    lists:flatten(io_lib:format("Error: Wrong resource number: ~p", [Num]))
+            throw({bad_argument,
+                   lists:flatten(io_lib:format("Wrong resource number: ~p", [Num]))})
     end.
 
 kick_session(User, Server, Resource, ReasonText) ->
@@ -721,9 +1005,8 @@ kick_session(User, Server, Resource, ReasonText) ->
     ok.
 
 kick_this_session(User, Server, Resource, Reason) ->
-    ejabberd_sm:route(jlib:make_jid(<<"">>, <<"">>, <<"">>),
-                      jlib:make_jid(User, Server, Resource),
-                      {broadcast, {exit, Reason}}).
+    ejabberd_sm:route(jid:make(User, Server, Resource),
+                      {exit, Reason}).
 
 status_num(Host, Status) ->
     length(get_status_list(Host, Status)).
@@ -743,7 +1026,7 @@ get_status_list(Host, Status_required) ->
     Sessions2 = [ {Session#session.usr, Session#session.sid, Session#session.priority} || Session <- Sessions],
     Fhost = case Host of
 		<<"all">> ->
-		    %% All hosts are requested, so dont filter at all
+		    %% All hosts are requested, so don't filter at all
 		    fun(_, _) -> true end;
 		_ ->
 		    %% Filter the list, only Host is interesting
@@ -751,7 +1034,7 @@ get_status_list(Host, Status_required) ->
 	    end,
     Sessions3 = [ {Pid, Server, Priority} || {{_User, Server, _Resource}, {_, Pid}, Priority} <- Sessions2, apply(Fhost, [Server, Host])],
     %% For each Pid, get its presence
-    Sessions4 = [ {catch ejabberd_c2s:get_presence(Pid), Server, Priority} || {Pid, Server, Priority} <- Sessions3],
+    Sessions4 = [ {catch get_presence(Pid), Server, Priority} || {Pid, Server, Priority} <- Sessions3],
     %% Filter by status
     Fstatus = case Status_required of
 		  <<"all">> ->
@@ -778,38 +1061,73 @@ connected_users_info() ->
 			      PI when is_integer(PI) -> PI;
 			      _ -> nil
 			  end,
-	      {[U, $@, S, $/, R], atom_to_list(Conn), IPS, Port, PriorityI, NodeS, Uptime}
+	      {binary_to_list(<<U/binary, $@, S/binary, $/, R/binary>>),
+	       atom_to_list(Conn), IPS, Port, PriorityI, NodeS, Uptime}
       end,
       USRIs).
 
 connected_users_vhost(Host) ->
     USRs = ejabberd_sm:get_vh_session_list(Host),
-    [ [U, $@, S, $/, R] || {U, S, R} <- USRs].
+    [ jid:encode(jid:make(USR)) || USR <- USRs].
 
 %% Code copied from ejabberd_sm.erl and customized
 dirty_get_sessions_list2() ->
-    mnesia:dirty_select(
+    Ss = mnesia:dirty_select(
       session,
-      [{#session{usr = '$1', sid = '$2', priority = '$3', info = '$4', _ = '_'},
-	[],
-	[['$1', '$2', '$3', '$4']]}]).
+	   [{#session{usr = '$1', sid = '$2', priority = '$3', info = '$4',
+		 _ = '_'},
+	     [],
+	     [['$1', '$2', '$3', '$4']]}]),
+    lists:filter(fun([_USR, _SID, _Priority, Info]) ->
+			 not proplists:get_bool(offline, Info)
+		 end, Ss).
 
 %% Make string more print-friendly
 stringize(String) ->
     %% Replace newline characters with other code
     ejabberd_regexp:greplace(String, <<"\n">>, <<"\\n">>).
 
-set_presence(User, Host, Resource, Type, Show, Status, Priority) ->
-    Pid = ejabberd_sm:get_session_pid(User, Host, Resource),
-    USR = jlib:jid_to_string(jlib:make_jid(User, Host, Resource)),
-    US = jlib:jid_to_string(jlib:make_jid(User, Host, <<>>)),
-    Message = {route_xmlstreamelement,
-	       {xmlel, <<"presence">>,
-		[{<<"from">>, USR}, {<<"to">>, US}, {<<"type">>, Type}],
-		[{xmlel, <<"show">>, [], [{xmlcdata, Show}]},
-		 {xmlel, <<"status">>, [], [{xmlcdata, Status}]},
-		 {xmlel, <<"priority">>, [], [{xmlcdata, Priority}]}]}},
-    Pid ! Message.
+get_presence(Pid) ->
+    Pres = #presence{from = From} = ejabberd_c2s:get_presence(Pid),
+    Show = case Pres of
+	       #presence{type = unavailable} -> <<"unavailable">>;
+	       #presence{show = undefined} -> <<"available">>;
+	       #presence{show = S} -> atom_to_binary(S, utf8)
+	   end,
+    Status = xmpp:get_text(Pres#presence.status),
+    {From#jid.user, From#jid.resource, Show, Status}.
+
+get_presence(U, S) ->
+    Pids = [ejabberd_sm:get_session_pid(U, S, R)
+	    || R <- ejabberd_sm:get_user_resources(U, S)],
+    OnlinePids = [Pid || Pid <- Pids, Pid=/=none],
+    case OnlinePids of
+	[] ->
+	    {jid:encode({U, S, <<>>}), <<"unavailable">>, <<"">>};
+	[SessionPid|_] ->
+	    {_User, Resource, Show, Status} = get_presence(SessionPid),
+	    FullJID = jid:encode({U, S, Resource}),
+	    {FullJID, Show, Status}
+    end.
+
+set_presence(User, Host, Resource, Type, Show, Status, Priority)
+        when is_integer(Priority) ->
+    BPriority = integer_to_binary(Priority),
+    set_presence(User, Host, Resource, Type, Show, Status, BPriority);
+set_presence(User, Host, Resource, Type, Show, Status, Priority0) ->
+    Priority = if is_integer(Priority0) -> Priority0;
+		  true -> binary_to_integer(Priority0)
+	       end,
+    Pres = #presence{
+        from = jid:make(User, Host, Resource),
+        to = jid:make(User, Host),
+        type = misc:binary_to_atom(Type),
+        status = xmpp:mk_text(Status),
+        show = misc:binary_to_atom(Show),
+        priority = Priority,
+        sub_els = []},
+    Ref = ejabberd_sm:get_session_pid(User, Host, Resource),
+    ejabberd_c2s:set_presence(Ref, Pres).
 
 user_sessions_info(User, Host) ->
     CurrentSec = calendar:datetime_to_gregorian_seconds({date(), time()}),
@@ -818,13 +1136,15 @@ user_sessions_info(User, Host) ->
 		   {'EXIT', _Reason} ->
 		       [];
 		   Ss ->
-		       Ss
+		       lists:filter(fun(#session{info = Info}) ->
+					    not proplists:get_bool(offline, Info)
+				    end, Ss)
 	       end,
     lists:map(
       fun(Session) ->
 	      {_U, _S, Resource} = Session#session.usr,
 	      {Now, Pid} = Session#session.sid,
-	      {_U, _Resource, Status, StatusText} = ejabberd_c2s:get_presence(Pid),
+	      {_U, _Resource, Status, StatusText} = get_presence(Pid),
 	      Info = Session#session.info,
 	      Priority = Session#session.priority,
 	      Conn = proplists:get_value(conn, Info),
@@ -843,20 +1163,12 @@ user_sessions_info(User, Host) ->
 %%%
 
 set_nickname(User, Host, Nickname) ->
-    R = mod_vcard:process_sm_iq(
-	  {jid, User, Host, <<>>, User, Host, <<>>},
-	  {jid, User, Host, <<>>, User, Host, <<>>},
-	  {iq, <<>>, set, <<>>, <<"en">>,
-	   {xmlel, <<"vCard">>, [
-	     {<<"xmlns">>, <<"vcard-temp">>}], [
-		{xmlel, <<"NICKNAME">>, [], [{xmlcdata, Nickname}]}
-            ]
-	  }}),
-    case R of
-	{iq, <<>>, result, <<>>, _L, []} ->
-	    ok;
-	_ ->
-	    error
+    VCard = xmpp:encode(#vcard_temp{nickname = Nickname}),
+    case mod_vcard:set_vcard(User, jid:nameprep(Host), VCard) of
+	{error, badarg} ->
+	    error;
+	ok ->
+	    ok
     end.
 
 get_vcard(User, Host, Name) ->
@@ -880,26 +1192,17 @@ set_vcard(User, Host, Name, Subname, SomeContent) ->
 %%
 %% Internal vcard
 
-get_module_resource(Server) ->
-    case gen_mod:get_module_opt(Server, ?MODULE, module_resource, fun(A) -> A end, none) of
-	none -> list_to_binary(atom_to_list(?MODULE));
-	R when is_binary(R) -> R
-    end.
-
 get_vcard_content(User, Server, Data) ->
-    [{_, Module, Function, _Opts}] = ets:lookup(sm_iqtable, {?NS_VCARD, Server}),
-    JID = jlib:make_jid(User, Server, get_module_resource(Server)),
-    IQ = #iq{type = get, xmlns = ?NS_VCARD},
-    IQr = Module:Function(JID, JID, IQ),
-    [A1] = IQr#iq.sub_el,
-    case A1#xmlel.children of
-	[_|_] ->
-	    case get_vcard(Data, A1) of
+    case mod_vcard:get_vcard(jid:nodeprep(User), jid:nameprep(Server)) of
+	[El|_] ->
+	    case get_vcard(Data, El) of
 		[false] -> throw(error_no_value_found_in_vcard);
-		ElemList -> ?DEBUG("ELS ~p", [ElemList]), [xml:get_tag_cdata(Elem) || Elem <- ElemList]
+		ElemList -> ?DEBUG("ELS ~p", [ElemList]), [fxml:get_tag_cdata(Elem) || Elem <- ElemList]
 	    end;
 	[] ->
-	    throw(error_no_vcard_found)
+	    throw(error_no_vcard_found);
+	error ->
+	    throw(database_failure)
     end.
 
 get_vcard([<<"TEL">>, TelType], {_, _, _, OldEls}) ->
@@ -917,37 +1220,31 @@ get_vcard([Data], A1) ->
     get_subtag(A1, Data).
 
 get_subtag(Xmlelement, Name) ->
-    [xml:get_subtag(Xmlelement, Name)].
+    [fxml:get_subtag(Xmlelement, Name)].
 
 set_vcard_content(User, Server, Data, SomeContent) ->
     ContentList = case SomeContent of
 	[Bin | _] when is_binary(Bin) -> SomeContent;
 	Bin when is_binary(Bin) -> [SomeContent]
     end,
-    [{_, Module, Function, _Opts}] = ets:lookup(sm_iqtable, {?NS_VCARD, Server}),
-    JID = jlib:make_jid(User, Server, get_module_resource(Server)),
-    IQ = #iq{type = get, xmlns = ?NS_VCARD},
-    IQr = Module:Function(JID, JID, IQ),
-
     %% Get old vcard
-    A4 = case IQr#iq.sub_el of
+    A4 = case mod_vcard:get_vcard(jid:nodeprep(User), jid:nameprep(Server)) of
 	     [A1] ->
 		 {_, _, _, A2} = A1,
 		 update_vcard_els(Data, ContentList, A2);
 	     [] ->
-		 update_vcard_els(Data, ContentList, [])
+		 update_vcard_els(Data, ContentList, []);
+	     error ->
+		 throw(database_failure)
 	 end,
-
     %% Build new vcard
     SubEl = {xmlel, <<"vCard">>, [{<<"xmlns">>,<<"vcard-temp">>}], A4},
-    IQ2 = #iq{type=set, sub_el = SubEl},
-
-    Module:Function(JID, JID, IQ2),
+    mod_vcard:set_vcard(User, jid:nameprep(Server), SubEl),
     ok.
 
 take_vcard_tel(TelType, [{xmlel, <<"TEL">>, _, SubEls}=OldEl | OldEls], NewEls, Taken) ->
     {Taken2, NewEls2} = case lists:keymember(TelType, 2, SubEls) of
-	true -> {xml:get_subtag(OldEl, <<"NUMBER">>), NewEls};
+	true -> {fxml:get_subtag(OldEl, <<"NUMBER">>), NewEls};
 	false -> {Taken, [OldEl | NewEls]}
     end,
     take_vcard_tel(TelType, OldEls, NewEls2, Taken2);
@@ -1003,11 +1300,7 @@ add_rosteritem(LU, LS, User, Server, Nick, Group, Subscription, Xattrs) ->
 
 subscribe(LU, LS, User, Server, Nick, Group, Subscription, _Xattrs) ->
     ItemEl = build_roster_item(User, Server, {add, Nick, Subscription, Group}),
-    mod_roster:set_items(
-	LU, LS,
-	{xmlel, <<"query">>,
-            [{<<"xmlns">>, ?NS_ROSTER}],
-            [ItemEl]}).
+    mod_roster:set_items(LU, LS, #roster_query{items = [ItemEl]}).
 
 delete_rosteritem(LocalUser, LocalServer, User, Server) ->
     case unsubscribe(LocalUser, LocalServer, User, Server) of
@@ -1020,11 +1313,7 @@ delete_rosteritem(LocalUser, LocalServer, User, Server) ->
 
 unsubscribe(LU, LS, User, Server) ->
     ItemEl = build_roster_item(User, Server, remove),
-    mod_roster:set_items(
-	LU, LS,
-	{xmlel, <<"query">>,
-            [{<<"xmlns">>, ?NS_ROSTER}],
-            [ItemEl]}).
+    mod_roster:set_items(LU, LS, #roster_query{items = [ItemEl]}).
 
 %% -----------------------------
 %% Get Roster
@@ -1039,7 +1328,7 @@ get_roster(User, Server) ->
 make_roster_xmlrpc(Roster) ->
     lists:foldl(
       fun(Item, Res) ->
-	      JIDS = jlib:jid_to_string(Item#roster.jid),
+	      JIDS = jid:encode(Item#roster.jid),
 	      Nick = Item#roster.name,
 	      Subs = atom_to_list(Item#roster.subscription),
 	      Ask = atom_to_list(Item#roster.ask),
@@ -1081,11 +1370,12 @@ subscribe_roster({Name, Server, Group, Nick}, [{Name, Server, _, _} | Roster]) -
     subscribe_roster({Name, Server, Group, Nick}, Roster);
 %% Subscribe Name2 to Name1
 subscribe_roster({Name1, Server1, Group1, Nick1}, [{Name2, Server2, Group2, Nick2} | Roster]) ->
-    subscribe(Name1, Server1, Name2, Server2, Nick2, Group2, <<"both">>, []),
+    subscribe(iolist_to_binary(Name1), iolist_to_binary(Server1), iolist_to_binary(Name2), iolist_to_binary(Server2),
+	iolist_to_binary(Nick2), iolist_to_binary(Group2), <<"both">>, []),
     subscribe_roster({Name1, Server1, Group1, Nick1}, Roster).
 
 push_alltoall(S, G) ->
-    Users = ejabberd_auth:get_vh_registered_users(S),
+    Users = ejabberd_auth:get_users(S),
     Users2 = build_list_users(G, Users, []),
     subscribe_all(Users2),
     ok.
@@ -1105,36 +1395,26 @@ push_roster_item(LU, LS, U, S, Action) ->
 		  end, ejabberd_sm:get_user_resources(LU, LS)).
 
 push_roster_item(LU, LS, R, U, S, Action) ->
-    LJID = jlib:make_jid(LU, LS, R),
+    LJID = jid:make(LU, LS, R),
     BroadcastEl = build_broadcast(U, S, Action),
-    ejabberd_sm:route(LJID, LJID, BroadcastEl),
+    ejabberd_sm:route(LJID, BroadcastEl),
     Item = build_roster_item(U, S, Action),
     ResIQ = build_iq_roster_push(Item),
-    ejabberd_router:route(LJID, LJID, ResIQ).
+    ejabberd_router:route(
+      xmpp:set_from_to(ResIQ, jid:remove_resource(LJID), LJID)).
 
 build_roster_item(U, S, {add, Nick, Subs, Group}) ->
-    {xmlel, <<"item">>,
-     [{<<"jid">>, jlib:jid_to_string(jlib:make_jid(U, S, <<>>))},
-      {<<"name">>, Nick},
-      {<<"subscription">>, Subs}],
-     [{xmlel, <<"group">>, [], [{xmlcdata, Group}]}]
-    };
+    Groups = binary:split(Group,<<";">>, [global]),
+    #roster_item{jid = jid:make(U, S),
+		 name = Nick,
+		 subscription = misc:binary_to_atom(Subs),
+		 groups = Groups};
 build_roster_item(U, S, remove) ->
-    {xmlel, <<"item">>,
-     [{<<"jid">>, jlib:jid_to_string(jlib:make_jid(U, S, <<>>))},
-      {<<"subscription">>, <<"remove">>}],
-     []
-    }.
+    #roster_item{jid = jid:make(U, S), subscription = remove}.
 
 build_iq_roster_push(Item) ->
-    {xmlel, <<"iq">>,
-     [{<<"type">>, <<"set">>}, {<<"id">>, <<"push">>}],
-     [{xmlel, <<"query">>,
-       [{<<"xmlns">>, ?NS_ROSTER}],
-       [Item]
-      }
-     ]
-    }.
+    #iq{type = set, id = <<"push">>,
+	sub_els = [#roster_query{items = [Item]}]}.
 
 build_broadcast(U, S, {add, _Nick, Subs, _Group}) ->
     build_broadcast(U, S, list_to_atom(binary_to_list(Subs)));
@@ -1143,31 +1423,30 @@ build_broadcast(U, S, remove) ->
 %% @spec (U::binary(), S::binary(), Subs::atom()) -> any()
 %% Subs = both | from | to | none
 build_broadcast(U, S, SubsAtom) when is_atom(SubsAtom) ->
-    {broadcast, {item, {U, S, <<>>}, SubsAtom}}.
+    {item, {U, S, <<>>}, SubsAtom}.
 
 %%%
 %%% Last Activity
 %%%
 
 get_last(User, Server) ->
-    case ejabberd_sm:get_user_resources(User, Server) of
+    {Now, Status} = case ejabberd_sm:get_user_resources(User, Server) of
         [] ->
             case mod_last:get_last_info(User, Server) of
                 not_found ->
-                    "Never";
-                {ok, Shift, Status} ->
-                    TimeStamp = {Shift div 1000000,
-                        Shift rem 1000000,
-                        0},
-                    {{Year, Month, Day}, {Hour, Minute, Second}} =
-                        calendar:now_to_local_time(TimeStamp),
-                    lists:flatten(
-                        io_lib:format(
-                            "~w-~.2.0w-~.2.0w ~.2.0w:~.2.0w:~.2.0w ~s",
-                            [Year, Month, Day, Hour, Minute, Second, Status]))
+		    {p1_time_compat:timestamp(), "NOT FOUND"};
+                {ok, Shift, Status1} ->
+                    {{Shift div 1000000, Shift rem 1000000, 0}, Status1}
             end;
         _ ->
-            "Online"
+	    {p1_time_compat:timestamp(), "ONLINE"}
+    end,
+    {xmpp_util:encode_timestamp(Now), Status}.
+
+set_last(User, Server, Timestamp, Status) ->
+    case mod_last:store_last_info(User, Server, Timestamp, Status) of
+        {ok, _} -> ok;
+	Error -> Error
     end.
 
 %%%
@@ -1180,20 +1459,13 @@ get_last(User, Server) ->
 %% <aa xmlns='bb'>Cluth</aa>
 
 private_get(Username, Host, Element, Ns) ->
-    From = jlib:make_jid(Username, Host, <<>>),
-    To = jlib:make_jid(Username, Host, <<>>),
-    IQ = {iq, <<>>, get, ?NS_PRIVATE, <<>>,
-	  {xmlel, <<"query">>,
-	   [{<<"xmlns">>,?NS_PRIVATE}],
-	   [{xmlel, Element, [{<<"xmlns">>, Ns}], []}]}},
-    ResIq = mod_private:process_sm_iq(From, To, IQ),
-    [{xmlel, <<"query">>,
-      [{<<"xmlns">>, ?NS_PRIVATE}],
-      [SubEl]}] = ResIq#iq.sub_el,
-    binary_to_list(xml:element_to_binary(SubEl)).
+    ElementXml = #xmlel{name = Element, attrs = [{<<"xmlns">>, Ns}]},
+    Els = mod_private:get_data(jid:nodeprep(Username), jid:nameprep(Host),
+			       [{Ns, ElementXml}]),
+    binary_to_list(fxml:element_to_binary(xmpp:encode(#private{sub_els = Els}))).
 
 private_set(Username, Host, ElementString) ->
-    case xml_stream:parse_element(ElementString) of
+    case fxml_stream:parse_element(ElementString) of
 	{error, Error} ->
 	    io:format("Error found parsing the element:~n  ~p~nError: ~p~n",
 		      [ElementString, Error]),
@@ -1203,13 +1475,9 @@ private_set(Username, Host, ElementString) ->
     end.
 
 private_set2(Username, Host, Xml) ->
-    From = jlib:make_jid(Username, Host, <<>>),
-    To = jlib:make_jid(Username, Host, <<>>),
-    IQ = {iq, <<>>, set, ?NS_PRIVATE, <<>>,
-	  {xmlel, <<"query">>,
-	   [{<<"xmlns">>, ?NS_PRIVATE}],
-	   [Xml]}},
-    mod_private:process_sm_iq(From, To, IQ),
+    NS = fxml:get_tag_attr_s(<<"xmlns">>, Xml),
+    mod_private:set_data(jid:nodeprep(Username), jid:nameprep(Host),
+			 [{NS, Xml}]),
     ok.
 
 %%%
@@ -1224,11 +1492,11 @@ srg_create(Group, Host, Name, Description, Display) ->
     Opts = [{name, Name},
 	    {displayed_groups, DisplayList},
 	    {description, Description}],
-    {atomic, ok} = mod_shared_roster:create_group(Host, Group, Opts),
+    {atomic, _} = mod_shared_roster:create_group(Host, Group, Opts),
     ok.
 
 srg_delete(Group, Host) ->
-    {atomic, ok} = mod_shared_roster:delete_group(Host, Group),
+    {atomic, _} = mod_shared_roster:delete_group(Host, Group),
     ok.
 
 srg_list(Host) ->
@@ -1239,24 +1507,24 @@ srg_get_info(Group, Host) ->
 	Os when is_list(Os) -> Os;
 	error -> []
     end,
-    [{jlib:atom_to_binary(Title),
-      io_lib:format("~p", [btl(Value)])} || {Title, Value} <- Opts].
+    [{misc:atom_to_binary(Title), to_list(Value)} || {Title, Value} <- Opts].
 
-btl([]) -> [];
-btl([B|L]) -> [btl(B)|btl(L)];
-btl(B) -> binary_to_list(B).
+to_list([]) -> [];
+to_list([H|T]) -> [to_list(H)|to_list(T)];
+to_list(E) when is_atom(E) -> atom_to_list(E);
+to_list(E) -> binary_to_list(E).
 
 srg_get_members(Group, Host) ->
     Members = mod_shared_roster:get_group_explicit_users(Host,Group),
-    [jlib:jid_to_string(jlib:make_jid(MUser, MServer, <<>>))
+    [jid:encode(jid:make(MUser, MServer))
      || {MUser, MServer} <- Members].
 
 srg_user_add(User, Host, Group, GroupHost) ->
-    {atomic, ok} = mod_shared_roster:add_user_to_group(GroupHost, {User, Host}, Group),
+    mod_shared_roster:add_user_to_group(GroupHost, {User, Host}, Group),
     ok.
 
 srg_user_del(User, Host, Group, GroupHost) ->
-    {atomic, ok} = mod_shared_roster:remove_user_from_group(GroupHost, {User, Host}, Group),
+    mod_shared_roster:remove_user_from_group(GroupHost, {User, Host}, Group),
     ok.
 
 
@@ -1267,73 +1535,56 @@ srg_user_del(User, Host, Group, GroupHost) ->
 %% @doc Send a message to a Jabber account.
 %% @spec (Type::binary(), From::binary(), To::binary(), Subject::binary(), Body::binary()) -> ok
 send_message(Type, From, To, Subject, Body) ->
+    FromJID = jid:decode(From),
+    ToJID = jid:decode(To),
     Packet = build_packet(Type, Subject, Body),
-    send_packet_all_resources(From, To, Packet).
-
-%% @doc Send a packet to a Jabber account.
-%% If a resource was specified in the JID,
-%% the packet is sent only to that specific resource.
-%% If no resource was specified in the JID,
-%% and the user is remote or local but offline,
-%% the packet is sent to the bare JID.
-%% If the user is local and is online in several resources,
-%% the packet is sent to all its resources.
-send_packet_all_resources(FromJIDString, ToJIDString, Packet) ->
-    FromJID = jlib:string_to_jid(FromJIDString),
-    ToJID = jlib:string_to_jid(ToJIDString),
-    ToUser = ToJID#jid.user,
-    ToServer = ToJID#jid.server,
-    case ToJID#jid.resource of
-	<<>> ->
-	    send_packet_all_resources(FromJID, ToUser, ToServer, Packet);
-	Res ->
-	    send_packet_all_resources(FromJID, ToUser, ToServer, Res, Packet)
-    end.
-
-send_packet_all_resources(FromJID, ToUser, ToServer, Packet) ->
-    case ejabberd_sm:get_user_resources(ToUser, ToServer) of
-	[] ->
-	    send_packet_all_resources(FromJID, ToUser, ToServer, <<>>, Packet);
-	ToResources ->
-	    lists:foreach(
-	      fun(ToResource) ->
-		      send_packet_all_resources(FromJID, ToUser, ToServer,
-						ToResource, Packet)
-	      end,
-	      ToResources)
-    end.
-
-send_packet_all_resources(FromJID, ToU, ToS, ToR, Packet) ->
-    ToJID = jlib:make_jid(ToU, ToS, ToR),
-    ejabberd_router:route(FromJID, ToJID, Packet).
+    ejabberd_router:route(xmpp:set_from_to(Packet, FromJID, ToJID)).
 
 build_packet(Type, Subject, Body) ->
-    Tail = if Subject == <<"">>; Type == <<"chat">> -> [];
-	      true -> [{xmlel, <<"subject">>, [], [{xmlcdata, Subject}]}]
-	   end,
-    {xmlel, <<"message">>,
-     [{<<"type">>, Type}, {<<"id">>, randoms:get_string()}],
-     [{xmlel, <<"body">>, [], [{xmlcdata, Body}]} | Tail]
-    }.
+    #message{type = misc:binary_to_atom(Type),
+	     body = xmpp:mk_text(Body),
+	     id = randoms:get_string(),
+	     subject = xmpp:mk_text(Subject)}.
+
+send_stanza(FromString, ToString, Stanza) ->
+    try
+	#xmlel{} = El = fxml_stream:parse_element(Stanza),
+	From = jid:decode(FromString),
+	To = jid:decode(ToString),
+	CodecOpts = ejabberd_config:codec_options(From#jid.lserver),
+	Pkt = xmpp:decode(El, ?NS_CLIENT, CodecOpts),
+	ejabberd_router:route(xmpp:set_from_to(Pkt, From, To))
+    catch _:{xmpp_codec, Why} ->
+	    io:format("incorrect stanza: ~s~n", [xmpp:format_error(Why)]),
+	    {error, Why};
+	  _:{badmatch, {error, Why}} ->
+	    io:format("invalid xml: ~p~n", [Why]),
+	    {error, Why};
+	  _:{bad_jid, S} ->
+	    io:format("malformed JID: ~s~n", [S]),
+	    {error, "JID malformed"}
+    end.
 
 send_stanza_c2s(Username, Host, Resource, Stanza) ->
-    C2sPid = ejabberd_sm:get_session_pid(Username, Host, Resource),
-    XmlEl = xml_stream:parse_element(Stanza),
-    p1_fsm:send_event(C2sPid, {xmlstreamelement, XmlEl}).
+    case {fxml_stream:parse_element(Stanza),
+          ejabberd_sm:get_session_pid(Username, Host, Resource)}
+    of
+	{{error, Error}, _} ->
+	    {error, Error};
+	{_, none} ->
+	    {error, no_session};
+	{XmlEl, C2sPid} ->
+	    p1_fsm:send_event(C2sPid, {xmlstreamelement, XmlEl})
+    end.
 
 privacy_set(Username, Host, QueryS) ->
-    From = jlib:make_jid(Username, Host, <<"">>),
-    To = jlib:make_jid(<<"">>, Host, <<"">>),
-    QueryEl = xml_stream:parse_element(QueryS),
-    StanzaEl = {xmlel, <<"iq">>, [{<<"type">>, <<"set">>}], [QueryEl]},
-    IQ = jlib:iq_query_info(StanzaEl),
-    ejabberd_hooks:run_fold(
-		     privacy_iq_set,
-		     Host,
-		     {error, ?ERR_FEATURE_NOT_IMPLEMENTED},
-		     [From, To, IQ]
-		    ),
-    ok.
+    Jid = jid:make(Username, Host),
+    QueryEl = fxml_stream:parse_element(QueryS),
+    SubEl = xmpp:decode(QueryEl),
+    IQ = #iq{type = set, id = <<"push">>, sub_els = [SubEl],
+	     from = Jid, to = Jid},
+    Result = mod_privacy:process_iq(IQ),
+    Result#iq.type == result.
 
 %%%
 %%% Stats
@@ -1342,14 +1593,15 @@ privacy_set(Username, Host, QueryS) ->
 stats(Name) ->
     case Name of
 	<<"uptimeseconds">> -> trunc(element(1, erlang:statistics(wall_clock))/1000);
-	<<"registeredusers">> -> lists:foldl(fun(Host, Sum) -> ejabberd_auth:get_vh_registered_users_number(Host) + Sum end, 0, ?MYHOSTS);
+	<<"processes">> -> length(erlang:processes());
+	<<"registeredusers">> -> lists:foldl(fun(Host, Sum) -> ejabberd_auth:count_users(Host) + Sum end, 0, ?MYHOSTS);
 	<<"onlineusersnode">> -> length(ejabberd_sm:dirty_get_my_sessions_list());
 	<<"onlineusers">> -> length(ejabberd_sm:dirty_get_sessions_list())
     end.
 
 stats(Name, Host) ->
     case Name of
-	<<"registeredusers">> -> ejabberd_auth:get_vh_registered_users_number(Host);
+	<<"registeredusers">> -> ejabberd_auth:count_users(Host);
 	<<"onlineusers">> -> length(ejabberd_sm:get_vh_session_list(Host))
     end.
 
@@ -1464,7 +1716,7 @@ decide_rip_jid({UName, UServer, _UResource}, Match_list) ->
 decide_rip_jid({UName, UServer}, Match_list) ->
     lists:any(
       fun(Match_string) ->
-	      MJID = jlib:string_to_jid(list_to_binary(Match_string)),
+	      MJID = jid:decode(list_to_binary(Match_string)),
 	      MName = MJID#jid.luser,
 	      MServer = MJID#jid.lserver,
 	      Is_server = is_glob_match(UServer, MServer),
@@ -1479,6 +1731,20 @@ decide_rip_jid({UName, UServer}, Match_list) ->
 	      end
       end,
       Match_list).
+
+user_action(User, Server, Fun, OK) ->
+    case ejabberd_auth:user_exists(User, Server) of
+        true ->
+ 	    case catch Fun() of
+                OK -> ok;
+ 		{error, Error} -> throw(Error);
+                Error ->
+                    ?ERROR_MSG("Command returned: ~p", [Error]),
+ 		    1
+ 	    end;
+ 	false ->
+ 	    throw({not_found, "unknown_user"})
+    end.
 
 %% Copied from ejabberd-2.0.0/src/acl.erl
 is_regexp_match(String, RegExp) ->
@@ -1498,5 +1764,4 @@ is_glob_match(String, <<"!", Glob/binary>>) ->
 is_glob_match(String, Glob) ->
     is_regexp_match(String, ejabberd_regexp:sh_to_awk(Glob)).
 
-mod_opt_type(module_resource) -> fun (A) -> A end;
-mod_opt_type(_) -> [module_resource].
+mod_options(_) -> [].

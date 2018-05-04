@@ -1,5 +1,7 @@
-ejabberd Community Edition [![Build Status](https://travis-ci.org/processone/ejabberd.svg?branch=master)](https://travis-ci.org/processone/ejabberd)
-=========================================
+ejabberd Community Edition 
+==========================
+
+[![Build Status](https://travis-ci.org/processone/ejabberd.svg?branch=master)](https://travis-ci.org/processone/ejabberd) [![Hex version](https://img.shields.io/hexpm/v/ejabberd.svg "Hex version")](https://hex.pm/packages/ejabberd)
 
 ejabberd is a distributed, fault-tolerant technology that allows the creation
 of large-scale instant messaging applications. The server can reliably support
@@ -106,19 +108,22 @@ To compile ejabberd you need:
  - GCC.
  - Libexpat 1.95 or higher.
  - Libyaml 0.1.4 or higher.
- - Erlang/OTP R16B03 or higher.
- - OpenSSL 0.9.8 or higher, for STARTTLS, SASL and SSL encryption.
+ - Erlang/OTP 17.5 or higher.
+ - OpenSSL 1.0.0 or higher, for STARTTLS, SASL and SSL encryption.
  - Zlib 1.2.3 or higher, for Stream Compression support (XEP-0138). Optional.
  - PAM library. Optional. For Pluggable Authentication Modules (PAM).
  - GNU Iconv 1.8 or higher, for the IRC Transport (mod_irc). Optional. Not
    needed on systems with GNU Libc.
  - ImageMagick's Convert program. Optional. For CAPTCHA challenges.
 
+If your system splits packages in libraries and development headers, you must
+install the development packages also.
 
 ### 1. Compile and install on *nix systems
 
 To compile ejabberd, execute the following commands.  The first one is only
-necessary if your source tree didn't come with a `configure` script.
+necessary if your source tree didn't come with a `configure` script (In this
+case you need autoconf installed).
 
     ./autogen.sh
     ./configure
@@ -159,6 +164,10 @@ In order to assist in the development of ejabberd, and particularly the
 execution of the test suite, a Vagrant environment is available at
 https://github.com/processone/ejabberd-vagrant-dev.
 
+To start ejabberd in development mode from the repository directory, you can
+type a command like:
+
+    EJABBERD_CONFIG_PATH=ejabberd.yml erl -pa ebin -pa deps/*/ebin -pa test -pa deps/elixir/lib/*/ebin/ -s ejabberd
 
 Links
 -----
